@@ -62,6 +62,36 @@ func quotaReservedWithoutAdmission(now time.Time) *kueue.Workload {
 	return wl
 }
 
+const legacyNegativeGPU corev1.ResourceName = "example.com/gpu"
+
+// legacyNegativeRequestPodSet is a PodSet that already carries a negative
+// container request, the way one written before
+// WorkloadValidateResourcesAreNonNegative would look.
+func legacyNegativeRequestPodSet() kueue.PodSet {
+	return *utiltestingapi.MakePodSet("a", 1).
+		Request(corev1.ResourceCPU, "8").
+		Request(legacyNegativeGPU, "-3").
+		Obj()
+}
+
+func legacyNegativeRequestWorkload() *kueue.Workload {
+	return utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+		PodSets(legacyNegativeRequestPodSet()).
+		Finalizers(kueue.ResourceInUseFinalizerName).
+		Obj()
+}
+
+func namedRequestContainer(name string, requests map[corev1.ResourceName]string) corev1.Container {
+	rl := make(corev1.ResourceList, len(requests))
+	for r, q := range requests {
+		rl[r] = resource.MustParse(q)
+	}
+	return corev1.Container{
+		Name: name,
+		Resources: corev1.ResourceRequirements{Requests: rl},
+	}
+}
+
 func TestValidateWorkload(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	specPath := field.NewPath("spec")
@@ -74,6 +104,7 @@ func TestValidateWorkload(t *testing.T) {
 		featureGates map[featuregate.Feature]bool
 		workload     *kueue.Workload
 		wantErr      error
+		wantDetail   string
 		wantWarnings admission.Warnings
 	}{
 		"valid": {
@@ -111,6 +142,7 @@ func TestValidateWorkload(t *testing.T) {
 			wantErr: field.ErrorList{
 				field.Invalid(statusPath.Child("admission", "podSetAssignments").Index(0).Child("resourceUsage").Key(string(corev1.ResourceCPU)), nil, ""),
 			}.ToAggregate(),
+			wantDetail: "is not a multiple of 3",
 		},
 		"should not request num-pods resource": {
 			workload: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
@@ -705,6 +737,46 @@ func TestValidateWorkload(t *testing.T) {
 				field.Invalid(specPath.Child("podSets"), 1, ""),
 			}.ToAggregate(),
 		},
+		"elastic partial scale-up first-create shape (one minCount podSet) is accepted": {
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlices:                          true,
+				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
+			},
+			workload: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+				PodSets(*utiltestingapi.MakePodSet("main", 10).SetMinimumCount(5).Obj()).
+				Obj(),
+			wantErr: nil,
+		},
+		"elastic partial scale-up probe shape (multiple minCount podSets) is accepted": {
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlices:                          true,
+				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
+			},
+			workload: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+				PodSets(
+					*utiltestingapi.MakePodSet("group-a", 10).SetMinimumCount(5).Obj(),
+					*utiltestingapi.MakePodSet("group-b", 10).SetMinimumCount(5).Obj(),
+				).
+				Obj(),
+			wantErr: nil,
+		},
+		"non-elastic multiple minCount podSets stay rejected with the partial scale-up gate on": {
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlices:                          true,
+				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
+			},
+			workload: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(
+					*utiltestingapi.MakePodSet("group-a", 10).SetMinimumCount(5).Obj(),
+					*utiltestingapi.MakePodSet("group-b", 10).SetMinimumCount(5).Obj(),
+				).
+				Obj(),
+			wantErr: field.ErrorList{
+				field.Invalid(specPath.Child("podSets"), 2, ""),
+			}.ToAggregate(),
+		},
 		"non-negative subGroupCount is accepted without warning": {
 			workload: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).PodSets(
 				*utiltestingapi.MakePodSet("main", 1).SubGroupCount(new(int32(0))).Obj(),
@@ -717,6 +789,15 @@ func TestValidateWorkload(t *testing.T) {
 			gotWarnings, gotErr := (&WorkloadWebhook{}).ValidateCreate(t.Context(), tc.workload)
 			if diff := cmp.Diff(tc.wantErr, gotErr, cmpopts.IgnoreFields(field.Error{}, "Detail", "BadValue")); diff != "" {
 				t.Errorf("ValidateCreate() error mismatch (-want +got):\n%s", diff)
+			}
+			if tc.wantDetail != "" {
+				gotErr := ValidateWorkload(tc.workload, nil)
+				if len(gotErr) == 0 {
+					t.Fatalf("expected an error but got none")
+				}
+				if gotErr[0].Detail != tc.wantDetail {
+					t.Errorf("unexpected error detail, want %q got %q", tc.wantDetail, gotErr[0].Detail)
+				}
 			}
 			if diff := cmp.Diff(tc.wantWarnings, gotWarnings); diff != "" {
 				t.Errorf("ValidateCreate() warnings mismatch (-want +got):\n%s", diff)
@@ -1427,6 +1508,202 @@ func TestValidateWorkloadUpdate(t *testing.T) {
 				Obj(),
 			wantErr: nil,
 		},
+		// A Workload written before WorkloadValidateResourcesAreNonNegative
+		// still carries the quantity. Refusing it on every update would
+		// strand it: an update is how it writes a condition, deactivates,
+		// and drops its finalizer (kueue#14373).
+		"a workload with a legacy negative request can write an Evicted condition": {
+			featureGates: map[featuregate.Feature]bool{features.WorkloadValidateResourcesAreNonNegative: true},
+			before:       legacyNegativeRequestWorkload(),
+			after: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(legacyNegativeRequestPodSet()).
+				Finalizers(kueue.ResourceInUseFinalizerName).
+				EvictedAt(now).
+				Obj(),
+			wantErr: nil,
+		},
+		"a workload with a legacy negative request can be deactivated": {
+			featureGates: map[featuregate.Feature]bool{features.WorkloadValidateResourcesAreNonNegative: true},
+			before:       legacyNegativeRequestWorkload(),
+			after: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(legacyNegativeRequestPodSet()).
+				Finalizers(kueue.ResourceInUseFinalizerName).
+				Active(false).
+				Obj(),
+			wantErr: nil,
+		},
+		"a reserved workload with a legacy negative request can be deactivated": {
+			featureGates: map[featuregate.Feature]bool{features.WorkloadValidateResourcesAreNonNegative: true},
+			before: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(legacyNegativeRequestPodSet()).
+				Finalizers(kueue.ResourceInUseFinalizerName).
+				ReserveQuotaAt(utiltestingapi.MakeAdmission("cluster-queue").
+					PodSets(kueue.PodSetAssignment{Name: "a"}).Obj(), now).
+				Obj(),
+			after: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(legacyNegativeRequestPodSet()).
+				Finalizers(kueue.ResourceInUseFinalizerName).
+				ReserveQuotaAt(utiltestingapi.MakeAdmission("cluster-queue").
+					PodSets(kueue.PodSetAssignment{Name: "a"}).Obj(), now).
+				Active(false).
+				Obj(),
+			wantErr: nil,
+		},
+		"a workload with a legacy negative request can drop its finalizer": {
+			featureGates: map[featuregate.Feature]bool{features.WorkloadValidateResourcesAreNonNegative: true},
+			before:       legacyNegativeRequestWorkload(),
+			after: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(legacyNegativeRequestPodSet()).
+				Obj(),
+			wantErr: nil,
+		},
+		"a workload with a legacy negative init-container request can drop its finalizer": {
+			featureGates: map[featuregate.Feature]bool{features.WorkloadValidateResourcesAreNonNegative: true},
+			before: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(*utiltestingapi.MakePodSet("a", 1).
+					InitContainers(namedRequestContainer("init", map[corev1.ResourceName]string{
+						legacyNegativeGPU: "-3",
+					})).
+					Obj()).
+				Finalizers(kueue.ResourceInUseFinalizerName).
+				Obj(),
+			after: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(*utiltestingapi.MakePodSet("a", 1).
+					InitContainers(namedRequestContainer("init", map[corev1.ResourceName]string{
+						legacyNegativeGPU: "-3",
+					})).
+					Obj()).
+				Obj(),
+			wantErr: nil,
+		},
+		"a workload with a legacy negative pod-level request can drop its finalizer": {
+			featureGates: map[featuregate.Feature]bool{features.WorkloadValidateResourcesAreNonNegative: true},
+			before: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(*utiltestingapi.MakePodSet("a", 1).
+					PodLevelRequest(legacyNegativeGPU, "-3").
+					Obj()).
+				Finalizers(kueue.ResourceInUseFinalizerName).
+				Obj(),
+			after: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(*utiltestingapi.MakePodSet("a", 1).
+					PodLevelRequest(legacyNegativeGPU, "-3").
+					Obj()).
+				Obj(),
+			wantErr: nil,
+		},
+		"changing a legacy negative request to another negative value is refused": {
+			featureGates: map[featuregate.Feature]bool{features.WorkloadValidateResourcesAreNonNegative: true},
+			before:       legacyNegativeRequestWorkload(),
+			after: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(*utiltestingapi.MakePodSet("a", 1).
+					Request(corev1.ResourceCPU, "8").
+					Request(legacyNegativeGPU, "-4").
+					Obj()).
+				Finalizers(kueue.ResourceInUseFinalizerName).
+				Obj(),
+			wantErr: field.ErrorList{
+				field.Invalid(podSetsPath.Index(0).Child("template", "spec", "containers").Index(0).Child("resources", "requests").Key(string(legacyNegativeGPU)), nil, ""),
+			}.ToAggregate(),
+		},
+		"introducing a new negative request beside a legacy one is refused": {
+			featureGates: map[featuregate.Feature]bool{features.WorkloadValidateResourcesAreNonNegative: true},
+			before:       legacyNegativeRequestWorkload(),
+			after: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(*utiltestingapi.MakePodSet("a", 1).
+					Request(corev1.ResourceCPU, "8").
+					Request(legacyNegativeGPU, "-3").
+					Request(corev1.ResourceMemory, "-1Gi").
+					Obj()).
+				Finalizers(kueue.ResourceInUseFinalizerName).
+				Obj(),
+			wantErr: field.ErrorList{
+				field.Invalid(podSetsPath.Index(0).Child("template", "spec", "containers").Index(0).Child("resources", "requests").Key(string(corev1.ResourceMemory)), nil, ""),
+			}.ToAggregate(),
+		},
+		"reordering containers keeps a leftover negative request allowed": {
+			featureGates: map[featuregate.Feature]bool{features.WorkloadValidateResourcesAreNonNegative: true},
+			before: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(*utiltestingapi.MakePodSet("a", 1).
+					Containers(
+						namedRequestContainer("a", map[corev1.ResourceName]string{legacyNegativeGPU: "-3"}),
+						namedRequestContainer("b", map[corev1.ResourceName]string{legacyNegativeGPU: "1"}),
+					).
+					Obj()).
+				Obj(),
+			after: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(*utiltestingapi.MakePodSet("a", 1).
+					Containers(
+						namedRequestContainer("b", map[corev1.ResourceName]string{legacyNegativeGPU: "1"}),
+						namedRequestContainer("a", map[corev1.ResourceName]string{legacyNegativeGPU: "-3"}),
+					).
+					Obj()).
+				Obj(),
+			wantErr: nil,
+		},
+		"a new container name at an old index does not inherit a leftover exemption": {
+			featureGates: map[featuregate.Feature]bool{features.WorkloadValidateResourcesAreNonNegative: true},
+			before: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(*utiltestingapi.MakePodSet("a", 1).
+					Containers(
+						namedRequestContainer("a", map[corev1.ResourceName]string{legacyNegativeGPU: "-3"}),
+						namedRequestContainer("b", map[corev1.ResourceName]string{legacyNegativeGPU: "1"}),
+					).
+					Obj()).
+				Obj(),
+			after: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(*utiltestingapi.MakePodSet("a", 1).
+					Containers(
+						namedRequestContainer("c", map[corev1.ResourceName]string{legacyNegativeGPU: "-3"}),
+						namedRequestContainer("b", map[corev1.ResourceName]string{legacyNegativeGPU: "1"}),
+					).
+					Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				field.Invalid(podSetsPath.Index(0).Child("template", "spec", "containers").Index(0).Child("resources", "requests").Key(string(legacyNegativeGPU)), nil, ""),
+			}.ToAggregate(),
+		},
+		"reordering init containers keeps a leftover negative request allowed": {
+			featureGates: map[featuregate.Feature]bool{features.WorkloadValidateResourcesAreNonNegative: true},
+			before: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(*utiltestingapi.MakePodSet("a", 1).
+					InitContainers(
+						namedRequestContainer("a", map[corev1.ResourceName]string{legacyNegativeGPU: "-3"}),
+						namedRequestContainer("b", map[corev1.ResourceName]string{legacyNegativeGPU: "1"}),
+					).
+					Obj()).
+				Obj(),
+			after: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(*utiltestingapi.MakePodSet("a", 1).
+					InitContainers(
+						namedRequestContainer("b", map[corev1.ResourceName]string{legacyNegativeGPU: "1"}),
+						namedRequestContainer("a", map[corev1.ResourceName]string{legacyNegativeGPU: "-3"}),
+					).
+					Obj()).
+				Obj(),
+			wantErr: nil,
+		},
+		"a new init-container name at an old index does not inherit a leftover exemption": {
+			featureGates: map[featuregate.Feature]bool{features.WorkloadValidateResourcesAreNonNegative: true},
+			before: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(*utiltestingapi.MakePodSet("a", 1).
+					InitContainers(
+						namedRequestContainer("a", map[corev1.ResourceName]string{legacyNegativeGPU: "-3"}),
+						namedRequestContainer("b", map[corev1.ResourceName]string{legacyNegativeGPU: "1"}),
+					).
+					Obj()).
+				Obj(),
+			after: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+				PodSets(*utiltestingapi.MakePodSet("a", 1).
+					InitContainers(
+						namedRequestContainer("c", map[corev1.ResourceName]string{legacyNegativeGPU: "-3"}),
+						namedRequestContainer("b", map[corev1.ResourceName]string{legacyNegativeGPU: "1"}),
+					).
+					Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				field.Invalid(podSetsPath.Index(0).Child("template", "spec", "initContainers").Index(0).Child("resources", "requests").Key(string(legacyNegativeGPU)), nil, ""),
+			}.ToAggregate(),
+		},
 		// Refusing this update would leave the object undeletable.
 		"a workload whose quota reservation lost its admission can still drop its finalizer": {
 			before: func() *kueue.Workload {
@@ -1447,6 +1724,79 @@ func TestValidateWorkloadUpdate(t *testing.T) {
 			}
 			if diff := cmp.Diff(tc.wantWarnings, gotWarnings); diff != "" {
 				t.Errorf("ValidateUpdate() warnings mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestWorkloadWebhookDefault(t *testing.T) {
+	elasticWorkload := func() *kueue.Workload {
+		return utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+			Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+			PodSets(*utiltestingapi.MakePodSet("main", 10).SetMinimumCount(5).Obj()).
+			Obj()
+	}
+	plainWorkload := func() *kueue.Workload {
+		return utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+			PodSets(*utiltestingapi.MakePodSet("main", 10).SetMinimumCount(5).Obj()).
+			Obj()
+	}
+
+	cases := map[string]struct {
+		featureGates map[featuregate.Feature]bool
+		workload     *kueue.Workload
+		wantCleared  bool
+	}{
+		"PartialAdmission off, plain workload: minCount cleared": {
+			featureGates: map[featuregate.Feature]bool{features.PartialAdmission: false},
+			workload:     plainWorkload(),
+			wantCleared:  true,
+		},
+		"PartialAdmission on, plain workload: minCount kept": {
+			featureGates: map[featuregate.Feature]bool{features.PartialAdmission: true},
+			workload:     plainWorkload(),
+			wantCleared:  false,
+		},
+		"PartialAdmission off, partial scale-up on, elastic workload: minCount kept": {
+			featureGates: map[featuregate.Feature]bool{
+				features.PartialAdmission:                                      false,
+				features.ElasticJobsViaWorkloadSlices:                          true,
+				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
+			},
+			workload:    elasticWorkload(),
+			wantCleared: false,
+		},
+		"PartialAdmission off, partial scale-up off, elastic workload: minCount cleared": {
+			featureGates: map[featuregate.Feature]bool{
+				features.PartialAdmission:                                      false,
+				features.ElasticJobsViaWorkloadSlices:                          true,
+				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: false,
+			},
+			workload:    elasticWorkload(),
+			wantCleared: true,
+		},
+		"PartialAdmission off, partial scale-up on, plain workload: minCount cleared": {
+			featureGates: map[featuregate.Feature]bool{
+				features.PartialAdmission:                                      false,
+				features.ElasticJobsViaWorkloadSlices:                          true,
+				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
+			},
+			workload:    plainWorkload(),
+			wantCleared: true,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGatesDuringTest(t, tc.featureGates)
+			wl := tc.workload.DeepCopy()
+			if err := (&WorkloadWebhook{}).Default(t.Context(), wl); err != nil {
+				t.Fatalf("Default() returned error: %v", err)
+			}
+			for _, ps := range wl.Spec.PodSets {
+				if cleared := ps.MinCount == nil; cleared != tc.wantCleared {
+					t.Errorf("podSet %q: minCount cleared = %v, want %v", ps.Name, cleared, tc.wantCleared)
+				}
 			}
 		})
 	}

@@ -32,6 +32,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/component-base/featuregate"
 	"k8s.io/component-base/metrics/testutil"
@@ -81,6 +82,10 @@ type scheduleTestCase struct {
 	workloads      []kueue.Workload
 	objects        []client.Object
 	admissionError error
+
+	additionalResourceFlavors []kueue.ResourceFlavor
+	topologies                []kueue.Topology
+	nodes                     []corev1.Node
 
 	// additional*Queues can hold any extra queues needed by the tc
 	additionalClusterQueues []kueue.ClusterQueue
@@ -206,7 +211,13 @@ func runScheduleTestCases(t *testing.T, cfg scheduleTestConfig, cases map[string
 								if _, ok := obj.(*kueue.Workload); ok && subResourceName == "status" && tc.admissionError != nil {
 									return tc.admissionError
 								}
-								return utiltesting.TreatSSAAsStrategicMerge(ctx, client, subResourceName, obj, patch, opts...)
+								return client.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+							},
+							SubResourceApply: func(ctx context.Context, client client.Client, subResourceName string, applyConf runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+								if subResourceName == "status" && tc.admissionError != nil {
+									return tc.admissionError
+								}
+								return utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration(ctx, client, subResourceName, applyConf, opts...)
 							},
 						})
 
@@ -222,6 +233,15 @@ func runScheduleTestCases(t *testing.T, cfg scheduleTestConfig, cases map[string
 					}
 					for i := range cfg.resourceFlavors {
 						cqCache.AddOrUpdateResourceFlavor(log, cfg.resourceFlavors[i])
+					}
+					for i := range tc.additionalResourceFlavors {
+						cqCache.AddOrUpdateResourceFlavor(log, &tc.additionalResourceFlavors[i])
+					}
+					for i := range tc.topologies {
+						cqCache.AddOrUpdateTopology(log, &tc.topologies[i])
+					}
+					for i := range tc.nodes {
+						cqCache.TASCache().SyncNode(&tc.nodes[i])
 					}
 					for _, cq := range allClusterQueues {
 						if err := cqCache.AddClusterQueue(ctx, &cq); err != nil {
@@ -261,8 +281,19 @@ func runScheduleTestCases(t *testing.T, cfg scheduleTestConfig, cases map[string
 					go qManager.CleanUpOnContext(ctx)
 					defer cancel()
 
+					rawSnapshots := make(map[*kueue.Workload]*kueue.Workload)
+					for _, cq := range allClusterQueues {
+						for _, info := range qManager.PendingWorkloadsInfo(kueue.ClusterQueueReference(cq.Name)) {
+							rawSnapshots[info.Obj] = info.Obj.DeepCopy()
+						}
+					}
 					scheduler.schedule(ctx)
 					wg.Wait()
+					for raw, original := range rawSnapshots {
+						if diff := cmp.Diff(original, raw); diff != "" {
+							t.Errorf("scheduling mutated the queued API object (-before,+after): %s", diff)
+						}
+					}
 
 					// Verify assignments in cache.
 					gotAssignments := make(map[workload.Reference]kueue.Admission)
@@ -2271,6 +2302,63 @@ func TestSchedule(t *testing.T) {
 			},
 			wantLeft: map[kueue.ClusterQueueReference][]workload.Reference{
 				"eng-alpha": {"eng-alpha/new"},
+			},
+		},
+		"covered and uncovered resources": {
+			additionalClusterQueues: []kueue.ClusterQueue{
+				*utiltestingapi.MakeClusterQueue("mixed-cq").
+					QueueingStrategy(kueue.StrictFIFO).
+					ResourceGroup(
+						*utiltestingapi.MakeFlavorQuotas("default").
+							Resource(corev1.ResourceCPU, "50").
+							Resource(corev1.ResourceMemory, "50Gi").
+							Obj(),
+					).
+					Obj(),
+			},
+			additionalLocalQueues: []kueue.LocalQueue{
+				*utiltestingapi.MakeLocalQueue("mixed", "eng-alpha").ClusterQueue("mixed-cq").Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("new-mixed", "eng-alpha").
+					Queue("mixed").
+					Request(corev1.ResourceCPU, "1").
+					Request(corev1.ResourceMemory, "1Mi").
+					Request("example.com/gpu", "1").
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("new-mixed", "eng-alpha").
+					Queue("mixed").
+					Request(corev1.ResourceCPU, "1").
+					Request(corev1.ResourceMemory, "1Mi").
+					Request("example.com/gpu", "1").
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadQuotaReserved,
+						Status:             metav1.ConditionFalse,
+						Reason:             kueue.WorkloadQuotaReservedReasonNoMatchingFlavor,
+						Message:            "couldn't assign flavors to pod set main: resource example.com/gpu unavailable in ClusterQueue",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadAdmitted,
+						Status:             metav1.ConditionFalse,
+						Reason:             kueue.WorkloadAdmittedReasonNoReservation,
+						Message:            "The workload has no reservation",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					ResourceRequests(kueue.PodSetRequest{
+						Name: "main",
+						Resources: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("1"),
+							corev1.ResourceMemory: resource.MustParse("1Mi"),
+							"example.com/gpu":     resource.MustParse("1"),
+						},
+					}).
+					Obj(),
+			},
+			wantLeft: map[kueue.ClusterQueueReference][]workload.Reference{
+				"mixed-cq": {"eng-alpha/new-mixed"},
 			},
 		},
 		"not enough resources to borrow, fallback to next flavor; WhenCanPreempt: TryNextFlavor": {
@@ -5672,6 +5760,7 @@ func TestSchedule(t *testing.T) {
 			// workloads that will be returned by the fake.client.
 			workloads: []kueue.Workload{
 				*utiltestingapi.MakeWorkload("foo-1", "sales").
+					ClusterName("worker-a").
 					ResourceVersion("1").
 					Queue("main").
 					PodSets(*utiltestingapi.MakePodSet("one", 10).
@@ -5715,6 +5804,7 @@ func TestSchedule(t *testing.T) {
 			// This may not be the same as previous "want*" values due to the stabbed apply status invocations in the test.
 			wantWorkloads: []kueue.Workload{
 				*utiltestingapi.MakeWorkload("foo-1", "sales").
+					ClusterName("worker-a").
 					ResourceVersion("2").
 					Queue("main").
 					PodSets(*utiltestingapi.MakePodSet("one", 10).
@@ -5755,6 +5845,7 @@ func TestSchedule(t *testing.T) {
 					}).
 					Obj(),
 				*utiltestingapi.MakeWorkload("foo-2", "sales").
+					ClusterName("worker-a").
 					Annotation(workloadslicing.WorkloadSliceReplacementFor, "sales/foo-1").
 					ResourceVersion("2").
 					Queue("main").
@@ -7675,6 +7766,17 @@ func TestSchedule(t *testing.T) {
 			},
 		},
 	}
+	// The merge-patch path currently only patches fields changed by its callback.
+	// Keep its existing ClusterName behavior while testing queued-object ownership.
+	sliceCase := cases["workload-slice fits in single clusterQueue"]
+	for _, wl := range sliceCase.wantWorkloads {
+		copy := wl.DeepCopy()
+		if copy.Name == "foo-2" {
+			copy.Status.ClusterName = nil
+		}
+		sliceCase.wantWorkloadUseMergePatch = append(sliceCase.wantWorkloadUseMergePatch, *copy)
+	}
+	cases["workload-slice fits in single clusterQueue"] = sliceCase
 	runScheduleTestCases(t, scheduleTestConfig{
 		queues:          queues,
 		clusterQueues:   clusterQueues,
@@ -8869,7 +8971,9 @@ func TestLastSchedulingContext(t *testing.T) {
 							utiltesting.MakeNamespace("default"),
 						).
 						WithStatusSubresource(&kueue.Workload{}).
-						WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge})
+						WithInterceptorFuncs(interceptor.Funcs{
+							SubResourceApply: utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration,
+						})
 
 					cl := clientBuilder.Build()
 					recorder := &utiltesting.EventRecorder{}
@@ -8923,29 +9027,25 @@ func TestLastSchedulingContext(t *testing.T) {
 						t.Errorf("Unexpected scheduled workloads (-want,+got):\n%s", diff)
 					}
 
-					for _, workloadReference := range tc.deleteWorkloads {
-						var wl kueue.Workload
-						err := cl.Get(ctx, workloadReference, &wl)
-						if err != nil {
-							t.Errorf("Unable to get workload: %v", err)
+					if len(tc.deleteWorkloads) > 0 {
+						for _, workloadReference := range tc.deleteWorkloads {
+							var wl kueue.Workload
+							err := cl.Get(ctx, workloadReference, &wl)
+							if err != nil {
+								t.Errorf("Unable to get workload: %v", err)
+							}
+							err = cl.Delete(ctx, &wl)
+							if err != nil {
+								t.Errorf("Delete workload failed: %v", err)
+							}
+							err = cqCache.DeleteWorkload(log, workload.Key(&wl))
+							if err != nil {
+								t.Errorf("Delete workload failed: %v", err)
+							}
+							qManager.QueueAssociatedInadmissibleWorkloadsAfter(ctx, workload.Key(&wl), nil)
 						}
-						err = cl.Delete(ctx, &wl)
-						if err != nil {
-							t.Errorf("Delete workload failed: %v", err)
-						}
-						err = cqCache.DeleteWorkload(log, workload.Key(&wl))
-						if err != nil {
-							t.Errorf("Delete workload failed: %v", err)
-						}
-						qManager.QueueAssociatedInadmissibleWorkloadsAfter(ctx, workload.Key(&wl), nil)
-					}
-					watcher.ProcessRequeues(ctx)
+						watcher.ProcessRequeues(ctx)
 
-					scheduler.schedule(ctx)
-					wg.Wait()
-
-					if features.Enabled(features.WorkloadRequestUseMergePatch) {
-						// Schedule again to ensure all workloads are admitted, as with MergePatch we enforce stricter patching.
 						scheduler.schedule(ctx)
 						wg.Wait()
 					}
@@ -9115,7 +9215,11 @@ func TestRequeueAndUpdate(t *testing.T) {
 				cl := utiltesting.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{
 					SubResourcePatch: func(ctx context.Context, client client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
 						updates++
-						return utiltesting.TreatSSAAsStrategicMerge(ctx, client, subResourceName, obj, patch, opts...)
+						return client.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+					},
+					SubResourceApply: func(ctx context.Context, client client.Client, subResourceName string, applyConf runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+						updates++
+						return utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration(ctx, client, subResourceName, applyConf, opts...)
 					},
 				}).WithObjects(objs...).WithStatusSubresource(objs...).Build()
 				recorder := &utiltesting.EventRecorder{}
@@ -9188,16 +9292,16 @@ func TestRequeueAndUpdate(t *testing.T) {
 // cycle resumes the scan or restarts it from the first flavor.
 func TestEntryMarkSkipped(t *testing.T) {
 	cases := map[string]struct {
-		preserveProgress      bool
-		wantLastAssignmentNil bool
+		preserveProgress       bool
+		wantFlavorScanStateNil bool
 	}{
 		"without the gate the assignment is discarded so every flavor is retried": {
-			preserveProgress:      false,
-			wantLastAssignmentNil: true,
+			preserveProgress:       false,
+			wantFlavorScanStateNil: true,
 		},
 		"with the gate the assignment is kept so the scan resumes": {
-			preserveProgress:      true,
-			wantLastAssignmentNil: false,
+			preserveProgress:       true,
+			wantFlavorScanStateNil: false,
 		},
 	}
 
@@ -9208,8 +9312,8 @@ func TestEntryMarkSkipped(t *testing.T) {
 			e := entry{
 				Head: qcache.Head{
 					Info: workload.Info{
-						LastAssignment: &workload.AssignmentClusterQueueState{
-							LastTriedFlavorIdx: []map[corev1.ResourceName]int{
+						FlavorScanState: &workload.FlavorScanState{
+							LastTriedFlavorIndexes: []map[corev1.ResourceName]int{
 								{corev1.ResourceCPU: 0},
 							},
 						},
@@ -9225,13 +9329,13 @@ func TestEntryMarkSkipped(t *testing.T) {
 			if want := "Workload no longer fits after processing another workload"; e.inadmissibleMsg != want {
 				t.Errorf("inadmissibleMsg = %q, want %q", e.inadmissibleMsg, want)
 			}
-			if got := e.LastAssignment == nil; got != tc.wantLastAssignmentNil {
-				t.Errorf("LastAssignment == nil is %v, want %v", got, tc.wantLastAssignmentNil)
+			if got := e.FlavorScanState == nil; got != tc.wantFlavorScanStateNil {
+				t.Errorf("FlavorScanState == nil is %v, want %v", got, tc.wantFlavorScanStateNil)
 			}
-			if !tc.wantLastAssignmentNil {
+			if !tc.wantFlavorScanStateNil {
 				// The retained progress must still name the flavor that was tried, since
 				// that is what NextFlavorToTryForPodSetResource reads.
-				if got := e.LastAssignment.LastTriedFlavorIdx[0][corev1.ResourceCPU]; got != 0 {
+				if got := e.FlavorScanState.LastTriedFlavorIndexes[0][corev1.ResourceCPU]; got != 0 {
 					t.Errorf("retained LastTriedFlavorIdx = %d, want 0", got)
 				}
 			}
@@ -9240,38 +9344,38 @@ func TestEntryMarkSkipped(t *testing.T) {
 }
 
 func TestEntryMarkPreemptionOutcome(t *testing.T) {
-	assignmentState := &workload.AssignmentClusterQueueState{}
+	assignmentState := &workload.FlavorScanState{}
 
 	cases := map[string]struct {
-		preempted             int
-		errors                int
-		wantMessage           string
-		wantRequeueReason     qcache.RequeueReason
-		wantLastAssignmentNil bool
+		preempted              int
+		errors                 int
+		wantMessage            string
+		wantRequeueReason      qcache.RequeueReason
+		wantFlavorScanStateNil bool
 	}{
 		"pending preemption": {
-			preempted:             2,
-			wantMessage:           "fits with preemption. Pending the preemption of 2 workload(s)",
-			wantRequeueReason:     qcache.RequeueReasonPendingPreemption,
-			wantLastAssignmentNil: true,
+			preempted:              2,
+			wantMessage:            "fits with preemption. Pending the preemption of 2 workload(s)",
+			wantRequeueReason:      qcache.RequeueReasonPendingPreemption,
+			wantFlavorScanStateNil: true,
 		},
 		"failed preemption": {
-			errors:                2,
-			wantMessage:           "fits with preemption. Preempting 2 workload(s) failed, will retry.",
-			wantRequeueReason:     qcache.RequeueReasonPreemptionFailed,
-			wantLastAssignmentNil: true,
+			errors:                 2,
+			wantMessage:            "fits with preemption. Preempting 2 workload(s) failed, will retry.",
+			wantRequeueReason:      qcache.RequeueReasonPreemptionFailed,
+			wantFlavorScanStateNil: true,
 		},
 		"preempted takes precedence over errors": {
-			preempted:             1,
-			errors:                1,
-			wantMessage:           "fits with preemption. Pending the preemption of 1 workload(s)",
-			wantRequeueReason:     qcache.RequeueReasonPendingPreemption,
-			wantLastAssignmentNil: true,
+			preempted:              1,
+			errors:                 1,
+			wantMessage:            "fits with preemption. Pending the preemption of 1 workload(s)",
+			wantRequeueReason:      qcache.RequeueReasonPendingPreemption,
+			wantFlavorScanStateNil: true,
 		},
 		"no outcome": {
-			wantMessage:           "fits with preemption",
-			wantRequeueReason:     qcache.RequeueReasonGeneric,
-			wantLastAssignmentNil: true,
+			wantMessage:            "fits with preemption",
+			wantRequeueReason:      qcache.RequeueReasonGeneric,
+			wantFlavorScanStateNil: true,
 		},
 	}
 
@@ -9281,7 +9385,7 @@ func TestEntryMarkPreemptionOutcome(t *testing.T) {
 				inadmissibleMsg: "fits with preemption",
 				Head: qcache.Head{
 					Info: workload.Info{
-						LastAssignment: assignmentState,
+						FlavorScanState: assignmentState,
 					},
 				},
 			}
@@ -9294,8 +9398,8 @@ func TestEntryMarkPreemptionOutcome(t *testing.T) {
 			if e.requeueReason != tc.wantRequeueReason {
 				t.Errorf("Unexpected requeue reason\nwant: %q\ngot:  %q", tc.wantRequeueReason, e.requeueReason)
 			}
-			if got := e.LastAssignment == nil; got != tc.wantLastAssignmentNil {
-				t.Errorf("Unexpected LastAssignment nil status\nwant: %v\ngot:  %v", tc.wantLastAssignmentNil, got)
+			if got := e.FlavorScanState == nil; got != tc.wantFlavorScanStateNil {
+				t.Errorf("Unexpected FlavorScanState nil status\nwant: %v\ngot:  %v", tc.wantFlavorScanStateNil, got)
 			}
 		})
 	}
@@ -9744,7 +9848,7 @@ func TestResourcesToReserve(t *testing.T) {
 				Borrowing: tc.borrowing,
 				Usage:     workload.Usage{Quota: workload.ResourceUsage{Assigned: tc.assignmentUsage}},
 			}
-			e := &entry{assignment: assignment, Head: qcache.Head{Info: *workload.NewInfo(
+			e := &entry{assignment: assignment, Head: qcache.Head{Info: *workload.NewInfo(log,
 				&kueue.Workload{},
 			)}}
 			cl := utiltesting.NewClientBuilder().
@@ -9761,14 +9865,14 @@ func TestResourcesToReserve(t *testing.T) {
 
 			i := 0
 			for fr, v := range tc.cqUsage {
-				quantity := resources.NewResourceFormatter().ResourceQuantity(fr.Resource, v.Int64())
+				quantity := resources.NewResourceFormatter().AmountQuantity(fr.Resource, v)
 				admission := utiltestingapi.MakeAdmission("cq").
 					PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
 						Assignment(fr.Resource, fr.Flavor, quantity.String()).
 						Obj()).
 					Obj()
 				wl := utiltestingapi.MakeWorkload(fmt.Sprintf("workload-%d", i), "default-namespace").ReserveQuotaAt(admission, now).Obj()
-				cqCache.AddOrUpdateWorkload(log, wl)
+				cqCache.AddOrUpdateWorkload(t.Context(), log, wl)
 				i++
 			}
 			snapshot, err := cqCache.Snapshot(ctx)
@@ -9935,7 +10039,22 @@ func TestSchedulerWhenWorkloadModifiedConcurrently(t *testing.T) {
 										return err
 									}
 								}
-								return utiltesting.TreatSSAAsStrategicMerge(ctx, c, subResourceName, obj, patch, opts...)
+								return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+							},
+							SubResourceApply: func(ctx context.Context, c client.Client, subResourceName string, applyConf runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+								if subResourceName == "status" && !patched {
+									patched = true
+									// Simulate concurrent modification by another controller
+									wlCopy := tc.workload.DeepCopy()
+									if wlCopy.Labels == nil {
+										wlCopy.Labels = make(map[string]string, 1)
+									}
+									wlCopy.Labels["test.kueue.x-k8s.io/timestamp"] = time.Now().String()
+									if err := c.Update(ctx, wlCopy); err != nil {
+										return err
+									}
+								}
+								return utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration(ctx, c, subResourceName, applyConf, opts...)
 							},
 						})
 					cl := clientBuilder.Build()
@@ -10038,7 +10157,7 @@ func TestSchedulerNotifiesWatchersWhenAssumedWorkloadAdmissionFailsWithNotFound(
 		WithObjects(ns, rf, cq, lq, wl).
 		WithStatusSubresource(&kueue.Workload{}).
 		WithInterceptorFuncs(interceptor.Funcs{
-			SubResourcePatch: func(context.Context, client.Client, string, client.Object, client.Patch, ...client.SubResourcePatchOption) error {
+			SubResourceApply: func(ctx context.Context, c client.Client, subResourceName string, applyConf runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
 				patchAttempted = true
 				return apierrors.NewNotFound(kueue.Resource("workload"), wl.Name)
 			},
@@ -10106,10 +10225,10 @@ func (r *workloadUpdateWatcherRecorder) NotifyWorkloadUpdate(oldWl, newWl *kueue
 	}
 }
 
-func TestLastAssignmentOutdated(t *testing.T) {
+func TestFlavorScanStateOutdated(t *testing.T) {
 	type args struct {
 		currentSchedulingCycle int64
-		last                   *workload.AssignmentClusterQueueState
+		last                   *workload.FlavorScanState
 		currentCQGeneration    int64
 		currentSchedulingHash  workload.EquivalenceHash
 	}
@@ -10124,9 +10243,9 @@ func TestLastAssignmentOutdated(t *testing.T) {
 			name: "Cluster queue allocatableResourceIncreasedGen increased",
 			args: args{
 				currentSchedulingCycle: 5,
-				last: &workload.AssignmentClusterQueueState{
-					ClusterQueueGeneration: 0,
-					SchedulingCycle:        1,
+				last: &workload.FlavorScanState{
+					AllocatableResourceGeneration: 0,
+					SchedulingCycle:               1,
 				},
 				currentCQGeneration: 1,
 			},
@@ -10136,9 +10255,9 @@ func TestLastAssignmentOutdated(t *testing.T) {
 			name: "AllocatableResourceGeneration not increased",
 			args: args{
 				currentSchedulingCycle: 5,
-				last: &workload.AssignmentClusterQueueState{
-					ClusterQueueGeneration: 0,
-					SchedulingCycle:        1,
+				last: &workload.FlavorScanState{
+					AllocatableResourceGeneration: 0,
+					SchedulingCycle:               1,
 				},
 				currentCQGeneration: 0,
 			},
@@ -10149,9 +10268,9 @@ func TestLastAssignmentOutdated(t *testing.T) {
 			preserveProgress: true,
 			args: args{
 				currentSchedulingCycle: 5,
-				last: &workload.AssignmentClusterQueueState{
-					ClusterQueueGeneration: 0,
-					SchedulingCycle:        4,
+				last: &workload.FlavorScanState{
+					AllocatableResourceGeneration: 0,
+					SchedulingCycle:               4,
 				},
 				currentCQGeneration: 1,
 			},
@@ -10162,9 +10281,9 @@ func TestLastAssignmentOutdated(t *testing.T) {
 			preserveProgress: true,
 			args: args{
 				currentSchedulingCycle: 5,
-				last: &workload.AssignmentClusterQueueState{
-					ClusterQueueGeneration: 0,
-					SchedulingCycle:        5,
+				last: &workload.FlavorScanState{
+					AllocatableResourceGeneration: 0,
+					SchedulingCycle:               5,
 				},
 				currentCQGeneration: 1,
 			},
@@ -10175,9 +10294,9 @@ func TestLastAssignmentOutdated(t *testing.T) {
 			preserveProgress: true,
 			args: args{
 				currentSchedulingCycle: 5,
-				last: &workload.AssignmentClusterQueueState{
-					ClusterQueueGeneration: 0,
-					SchedulingCycle:        3,
+				last: &workload.FlavorScanState{
+					AllocatableResourceGeneration: 0,
+					SchedulingCycle:               3,
 				},
 				currentCQGeneration: 1,
 			},
@@ -10188,10 +10307,10 @@ func TestLastAssignmentOutdated(t *testing.T) {
 			preserveProgress: true,
 			args: args{
 				currentSchedulingCycle: 5,
-				last: &workload.AssignmentClusterQueueState{
-					ClusterQueueGeneration: 0,
-					SchedulingCycle:        4,
-					SchedulingHash:         "shape-a",
+				last: &workload.FlavorScanState{
+					AllocatableResourceGeneration: 0,
+					SchedulingCycle:               4,
+					SchedulingHash:                "shape-a",
 				},
 				currentCQGeneration:   0,
 				currentSchedulingHash: "shape-b",
@@ -10203,10 +10322,10 @@ func TestLastAssignmentOutdated(t *testing.T) {
 			preserveProgress: true,
 			args: args{
 				currentSchedulingCycle: 5,
-				last: &workload.AssignmentClusterQueueState{
-					ClusterQueueGeneration: 0,
-					SchedulingCycle:        4,
-					SchedulingHash:         "shape-a",
+				last: &workload.FlavorScanState{
+					AllocatableResourceGeneration: 0,
+					SchedulingCycle:               4,
+					SchedulingHash:                "shape-a",
 				},
 				currentCQGeneration:   1,
 				currentSchedulingHash: "shape-a",
@@ -10218,10 +10337,10 @@ func TestLastAssignmentOutdated(t *testing.T) {
 			preserveProgress: true,
 			args: args{
 				currentSchedulingCycle: 5,
-				last: &workload.AssignmentClusterQueueState{
-					ClusterQueueGeneration: 0,
-					SchedulingCycle:        4,
-					SchedulingHash:         workload.SchedulingHashUnknown,
+				last: &workload.FlavorScanState{
+					AllocatableResourceGeneration: 0,
+					SchedulingCycle:               4,
+					SchedulingHash:                workload.SchedulingHashUnknown,
 				},
 				currentCQGeneration:   1,
 				currentSchedulingHash: "shape-b",
@@ -10233,10 +10352,10 @@ func TestLastAssignmentOutdated(t *testing.T) {
 			preserveProgress: false,
 			args: args{
 				currentSchedulingCycle: 5,
-				last: &workload.AssignmentClusterQueueState{
-					ClusterQueueGeneration: 0,
-					SchedulingCycle:        4,
-					SchedulingHash:         "shape-a",
+				last: &workload.FlavorScanState{
+					AllocatableResourceGeneration: 0,
+					SchedulingCycle:               4,
+					SchedulingHash:                "shape-a",
 				},
 				currentCQGeneration:   0,
 				currentSchedulingHash: "shape-b",
@@ -10248,9 +10367,9 @@ func TestLastAssignmentOutdated(t *testing.T) {
 			preserveProgress: false,
 			args: args{
 				currentSchedulingCycle: 5,
-				last: &workload.AssignmentClusterQueueState{
-					ClusterQueueGeneration: 0,
-					SchedulingCycle:        4,
+				last: &workload.FlavorScanState{
+					AllocatableResourceGeneration: 0,
+					SchedulingCycle:               4,
 				},
 				currentCQGeneration: 1,
 			},
@@ -10260,8 +10379,8 @@ func TestLastAssignmentOutdated(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			features.SetFeatureGateDuringTest(t, features.FlavorFungibilityPreserveScanProgress, tt.preserveProgress)
-			if got := lastAssignmentOutdated(tt.args.last, tt.args.currentCQGeneration, tt.args.currentSchedulingCycle, tt.args.currentSchedulingHash); got != tt.want {
-				t.Errorf("LastAssignmentOutdated() = %v, want %v", got, tt.want)
+			if got := flavorScanStateOutdated(tt.args.last, tt.args.currentCQGeneration, tt.args.currentSchedulingCycle, tt.args.currentSchedulingHash); got != tt.want {
+				t.Errorf("FlavorScanStatesOutdated() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -10318,8 +10437,8 @@ func TestFitsDedupsOverlappingVictims(t *testing.T) {
 		t.Fatal("ClusterQueue snapshot missing")
 	}
 
-	victimInfo := workload.NewInfo(victimWL)
-	otherInfo := workload.NewInfo(otherWL)
+	victimInfo := workload.NewInfo(log, victimWL)
+	otherInfo := workload.NewInfo(log, otherWL)
 	snapshot.AddWorkload(victimInfo)
 	snapshot.AddWorkload(otherInfo)
 
