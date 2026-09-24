@@ -17,6 +17,7 @@ limitations under the License.
 package jobframework_test
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -25,12 +26,15 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/component-base/featuregate"
 	"k8s.io/utils/ptr"
 
+	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
 	mocks "sigs.k8s.io/kueue/internal/mocks/controller/jobframework"
+	kueueconstants "sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/controller/constants"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
 	"sigs.k8s.io/kueue/pkg/features"
@@ -418,7 +422,7 @@ func TestValidateJobOnUpdate(t *testing.T) {
 			oldMJ := newMockJob(tc.oldJob)
 			newMJ := newMockJob(tc.newJob)
 
-			gotErr := jobframework.ValidateJobOnUpdate(oldMJ, newMJ, func(string) bool { return tc.nsHasDefaultQueue })
+			gotErr := jobframework.ValidateJobOnUpdate(oldMJ, newMJ, func(string) bool { return tc.nsHasDefaultQueue }, nil)
 			if diff := cmp.Diff(tc.wantErr, gotErr, cmpopts.IgnoreFields(field.Error{}, "BadValue", "Detail")); diff != "" {
 				t.Errorf("Unexpected error (-want,+got):\n%s", diff)
 			}
@@ -428,6 +432,7 @@ func TestValidateJobOnUpdate(t *testing.T) {
 
 func TestValidateJobOnCreate(t *testing.T) {
 	elasticAnnotationPath := field.NewPath("metadata", "annotations").Key(workloadslicing.EnabledAnnotationKey)
+	scaleUpStrategyPath := field.NewPath("metadata", "annotations").Key(kueueconstants.ElasticJobScaleUpStrategyAnnotationKey)
 	testCases := map[string]struct {
 		job          *batchv1.Job
 		gvk          schema.GroupVersionKind
@@ -465,6 +470,99 @@ func TestValidateJobOnCreate(t *testing.T) {
 			gvk:          schema.GroupVersionKind{Group: "jobset.x-k8s.io", Version: "v1alpha2", Kind: "JobSet"},
 			featureGates: map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlices: false},
 		},
+		"scale-up strategy atomic is allowed with elastic job and feature gate": {
+			job: utiltestingjob.MakeJob("test-job", "ns1").
+				SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+				SetAnnotation(kueueconstants.ElasticJobScaleUpStrategyAnnotationKey, kueueconstants.ElasticJobScaleUpStrategyAtomic).
+				Obj(),
+			gvk: batchv1.SchemeGroupVersion.WithKind("Job"),
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlices: true,
+			},
+		},
+		"scale-up strategy partial is allowed with elastic job and feature gate": {
+			job: utiltestingjob.MakeJob("test-job", "ns1").
+				SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+				SetAnnotation(kueueconstants.ElasticJobScaleUpStrategyAnnotationKey, kueueconstants.ElasticJobScaleUpStrategyPartial).
+				Obj(),
+			gvk: batchv1.SchemeGroupVersion.WithKind("Job"),
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlices:                          true,
+				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
+			},
+		},
+		"scale-up strategy is ignored when partial replica scale-up gate is disabled": {
+			job: utiltestingjob.MakeJob("test-job", "ns1").
+				SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+				SetAnnotation(kueueconstants.ElasticJobScaleUpStrategyAnnotationKey, kueueconstants.ElasticJobScaleUpStrategyPartial).
+				Obj(),
+			gvk: batchv1.SchemeGroupVersion.WithKind("Job"),
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlices:                          true,
+				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: false,
+			},
+		},
+		"scale-up strategy without elastic job is rejected": {
+			job: utiltestingjob.MakeJob("test-job", "ns1").
+				SetAnnotation(kueueconstants.ElasticJobScaleUpStrategyAnnotationKey, kueueconstants.ElasticJobScaleUpStrategyPartial).
+				Obj(),
+			gvk: batchv1.SchemeGroupVersion.WithKind("Job"),
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlices:                          true,
+				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
+			},
+			wantErr: field.ErrorList{
+				field.Forbidden(scaleUpStrategyPath,
+					fmt.Sprintf("requires the %q annotation set to %q", workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue)),
+			},
+		},
+		"scale-up strategy is ignored when partial replica scale-up gate is disabled and ElasticJobsViaWorkloadSlices is off": {
+			job: utiltestingjob.MakeJob("test-job", "ns1").
+				SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+				SetAnnotation(kueueconstants.ElasticJobScaleUpStrategyAnnotationKey, kueueconstants.ElasticJobScaleUpStrategyPartial).
+				Obj(),
+			gvk:          batchv1.SchemeGroupVersion.WithKind("Job"),
+			featureGates: map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlices: false},
+		},
+		"scale-up strategy with invalid value is rejected": {
+			job: utiltestingjob.MakeJob("test-job", "ns1").
+				SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+				SetAnnotation(kueueconstants.ElasticJobScaleUpStrategyAnnotationKey, "Partial").
+				Obj(),
+			gvk: batchv1.SchemeGroupVersion.WithKind("Job"),
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlices:                          true,
+				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
+			},
+			wantErr: field.ErrorList{
+				field.NotSupported(scaleUpStrategyPath, "Partial", []string{kueueconstants.ElasticJobScaleUpStrategyAtomic, kueueconstants.ElasticJobScaleUpStrategyPartial}),
+			},
+		},
+		"scale-up strategy with empty value is rejected": {
+			job: utiltestingjob.MakeJob("test-job", "ns1").
+				SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+				SetAnnotation(kueueconstants.ElasticJobScaleUpStrategyAnnotationKey, "").
+				Obj(),
+			gvk: batchv1.SchemeGroupVersion.WithKind("Job"),
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlices:                          true,
+				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
+			},
+			wantErr: field.ErrorList{
+				field.NotSupported(scaleUpStrategyPath, "", []string{kueueconstants.ElasticJobScaleUpStrategyAtomic, kueueconstants.ElasticJobScaleUpStrategyPartial}),
+			},
+		},
+		"scale-up strategy with invalid value is ignored when partial replica scale-up gate is disabled": {
+			job: utiltestingjob.MakeJob("test-job", "ns1").
+				SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+				SetAnnotation(kueueconstants.ElasticJobScaleUpStrategyAnnotationKey, "Partial").
+				Obj(),
+			gvk: batchv1.SchemeGroupVersion.WithKind("Job"),
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlices:                          true,
+				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: false,
+			},
+		},
 	}
 
 	for tcName, tc := range testCases {
@@ -476,8 +574,106 @@ func TestValidateJobOnCreate(t *testing.T) {
 			mj.EXPECT().Object().Return(tc.job).AnyTimes()
 			mj.EXPECT().GVK().Return(tc.gvk).AnyTimes()
 
-			gotErr := jobframework.ValidateJobOnCreate(mj)
+			gotErr := jobframework.ValidateJobOnCreate(mj, nil)
 			if diff := cmp.Diff(tc.wantErr, gotErr, cmpopts.IgnoreFields(field.Error{}, "BadValue", "Detail")); diff != "" {
+				t.Errorf("Unexpected error (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestValidateJobOnCreateWaitForPodsReadyAnnotation(t *testing.T) {
+	maxTimeout := &metav1.Duration{Duration: configapi.DefaultMaxTimeoutOnWorkload}
+	annotationPath := field.NewPath("metadata", "annotations").Key(constants.WaitForPodsReadyAnnotation)
+
+	testCases := map[string]struct {
+		annotation string
+		wantErr    field.ErrorList
+	}{
+		"valid timeout only": {
+			annotation: `{"timeoutSeconds": 10}`,
+		},
+		"valid timeout and recoveryTimeout": {
+			annotation: `{"timeoutSeconds": 10, "recoveryTimeoutSeconds": 20}`,
+		},
+		"only recoveryTimeout without timeout is rejected": {
+			annotation: `{"recoveryTimeoutSeconds": 20}`,
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:   field.ErrorTypeInvalid,
+					Field:  annotationPath.String(),
+					Detail: "timeoutSeconds must be greater than 0",
+				},
+			},
+		},
+		"zero timeout is rejected": {
+			annotation: `{"timeoutSeconds": 0}`,
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:   field.ErrorTypeInvalid,
+					Field:  annotationPath.String(),
+					Detail: "timeoutSeconds must be greater than 0",
+				},
+			},
+		},
+		"zero recoveryTimeoutSeconds is rejected": {
+			annotation: `{"timeoutSeconds": 10, "recoveryTimeoutSeconds": 0}`,
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:   field.ErrorTypeInvalid,
+					Field:  annotationPath.String(),
+					Detail: "recoveryTimeoutSeconds must be greater than 0 seconds",
+				},
+			},
+		},
+		"timeout exceeding MaxTimeoutOnWorkload is rejected": {
+			annotation: `{"timeoutSeconds": 7201}`,
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:   field.ErrorTypeInvalid,
+					Field:  annotationPath.String(),
+					Detail: "timeoutSeconds must be less than or equal to 7200 seconds",
+				},
+			},
+		},
+		"recoveryTimeout exceeding MaxTimeoutOnWorkload is rejected": {
+			annotation: `{"timeoutSeconds": 10, "recoveryTimeoutSeconds": 7201}`,
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:   field.ErrorTypeInvalid,
+					Field:  annotationPath.String(),
+					Detail: "recoveryTimeoutSeconds must be less than or equal to 7200 seconds",
+				},
+			},
+		},
+		"timeoutSeconds set to string is rejected at admission time": {
+			annotation: `{"timeoutSeconds": "foo"}`,
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:   field.ErrorTypeInvalid,
+					Field:  annotationPath.String(),
+					Detail: "must be a valid JSON object: json: cannot unmarshal string into Go struct field .timeoutSeconds of type int64",
+				},
+			},
+		},
+	}
+
+	for tcName, tc := range testCases {
+		t.Run(tcName, func(t *testing.T) {
+			features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{
+				features.WorkloadLevelWaitForPodsReady: true,
+			})
+			job := utiltestingjob.MakeJob("test-job", "ns1").
+				SetAnnotation(constants.WaitForPodsReadyAnnotation, tc.annotation).
+				Obj()
+
+			mockctrl := gomock.NewController(t)
+			mj := mocks.NewMockGenericJob(mockctrl)
+			mj.EXPECT().Object().Return(job).AnyTimes()
+			mj.EXPECT().GVK().Return(batchv1.SchemeGroupVersion.WithKind("Job")).AnyTimes()
+
+			gotErr := jobframework.ValidateJobOnCreate(mj, maxTimeout)
+			if diff := cmp.Diff(tc.wantErr, gotErr, cmpopts.IgnoreFields(field.Error{}, "BadValue")); diff != "" {
 				t.Errorf("Unexpected error (-want,+got):\n%s", diff)
 			}
 		})

@@ -457,7 +457,7 @@ func TestCQReconcile(t *testing.T) {
 
 			adapters, _ := jobs.NewIntegrationManager().GetMultiKueueAdapters(sets.New("batch/job"))
 			recorder := &utiltesting.EventRecorder{}
-			cRec := newClustersReconciler(c, TestNamespace, 0, defaultOrigin, nil, adapters, nil, nil, recorder)
+			cRec := newClustersReconciler(c, TestNamespace, withAdapters(adapters), withEventRecorder(recorder))
 			cRec.rootContext = ctx
 			for worker, wState := range tc.workers {
 				workerClient := NewNeverCachingClient(utiltesting.NewClientBuilder().
@@ -476,7 +476,7 @@ func TestCQReconcile(t *testing.T) {
 			helper, _ := admissioncheck.NewMultiKueueStoreHelper(c)
 			reconciler := newCQReconciler(c, helper, cRec, nil, 100*time.Millisecond)
 
-			_, gotErr := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: tc.cq.Name}})
+			_, gotErr := reconciler.Reconcile(ctx, reconcile.Request{Name: tc.cq.Name})
 			if gotErr != nil {
 				t.Errorf("unexpected reconcile error: %v", gotErr)
 			}

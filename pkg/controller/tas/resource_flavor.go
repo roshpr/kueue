@@ -22,7 +22,6 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/ptr"
@@ -65,7 +64,7 @@ var _ predicate.TypedPredicate[*kueue.ResourceFlavor] = (*rfReconciler)(nil)
 
 func newRfReconciler(c client.Client, queues *qcache.Manager, cache *schdcache.Cache, recorder events.EventRecorder, roleTracker *roletracker.RoleTracker) *rfReconciler {
 	return &rfReconciler{
-		logName:      TASResourceFlavorController,
+		logName:      "tas-resourceflavor-reconciler",
 		client:       c,
 		queues:       queues,
 		cache:        cache,
@@ -93,7 +92,7 @@ func (r *rfReconciler) setupWithManager(mgr ctrl.Manager, cache *schdcache.Cache
 			NeedLeaderElection:      new(false),
 			MaxConcurrentReconciles: mgr.GetControllerOptions().GroupKindConcurrency[kueue.SchemeGroupVersion.WithKind("ResourceFlavor").GroupKind().String()],
 		}).
-		WithLogConstructor(roletracker.NewLogConstructor(r.roleTracker, TASResourceFlavorController)).
+		WithLogConstructor(roletracker.NewLogConstructor(r.roleTracker, "tas-resourceflavor-reconciler")).
 		Complete(core.WithLeadingManager(mgr, r, &kueue.ResourceFlavor{}, cfg))
 }
 
@@ -136,9 +135,8 @@ func (h *nodeHandler) Generic(_ context.Context, e event.GenericEvent, q workque
 	// trigger reconcile for TAS flavors affected by the node being created or updated
 	for name, cache := range h.cache.CloneTASCache() {
 		if utiltas.NodeMatchesFlavor(node.Labels, cache.NodeLabels(), cache.TopologyLevels()) {
-			q.AddAfter(reconcile.Request{NamespacedName: types.NamespacedName{
-				Name: string(name),
-			}}, constants.UpdatesBatchPeriod)
+			q.AddAfter(reconcile.Request{
+				Name: string(name)}, constants.UpdatesBatchPeriod)
 		}
 	}
 }

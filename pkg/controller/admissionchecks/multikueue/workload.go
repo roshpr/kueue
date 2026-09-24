@@ -486,6 +486,8 @@ func (w *wlReconciler) reconcileGroup(ctx context.Context, group *wlGroup) (reco
 				return reconcile.Result{}, err
 			}
 
+			metrics.ReportMultiKueueWorkloadEvicted(admittedClusterQueue(group.local), evictedRemote, remoteEvictCond.Reason, w.roleTracker)
+
 			w.recorder.Eventf(group.local, nil, corev1.EventTypeNormal, "MultiKueue", "MultiKueue", acs.Message)
 			return reconcile.Result{}, nil
 		}
@@ -1179,10 +1181,9 @@ func (h *localJobHandler) queue(ctx context.Context, obj client.Object, q workqu
 func (w *wlReconciler) setupWithManager(mgr ctrl.Manager) error {
 	syncHndl := handler.Funcs{
 		GenericFunc: func(_ context.Context, e event.GenericEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-			q.AddAfter(reconcile.Request{NamespacedName: types.NamespacedName{
+			q.AddAfter(reconcile.Request{
 				Namespace: e.Object.GetNamespace(),
-				Name:      e.Object.GetName(),
-			}}, w.eventsBatchPeriod)
+				Name:      e.Object.GetName()}, w.eventsBatchPeriod)
 		},
 	}
 
@@ -1196,7 +1197,7 @@ func (w *wlReconciler) setupWithManager(mgr ctrl.Manager) error {
 	c, err := builder.
 		WithEventFilter(w).
 		WithOptions(controller.Options{
-			LogConstructor: roletracker.NewLogConstructor(w.roleTracker, "multikueue-workload"),
+			LogConstructor: roletracker.NewLogConstructor(w.roleTracker, "multikueue-workload-reconciler"),
 		}).
 		Build(w)
 	if err != nil {
@@ -1227,7 +1228,7 @@ func (w *wlReconciler) setupWithManager(mgr ctrl.Manager) error {
 			gvk := adapter.GVK()
 			h := &localJobHandler{client: w.client, gvk: gvk, eventsBatchPeriod: w.eventsBatchPeriod}
 			if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-				log := ctrl.LoggerFrom(ctx).WithName("multikueue-workload")
+				log := ctrl.LoggerFrom(ctx).WithName("multikueue-workload-reconciler")
 				jobframework.WaitForAPI(ctx, mgr, log, gvk, func() {
 					if err := c.Watch(source.Kind(mgr.GetCache(), emptyJob, h)); err != nil {
 						log.Error(err, "Unable to watch local job for MultiKueue spec sync", "gvk", gvk)

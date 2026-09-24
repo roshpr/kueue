@@ -17,9 +17,12 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"time"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	kueuealpha "sigs.k8s.io/kueue/apis/kueue/v1alpha1"
 )
@@ -32,21 +35,38 @@ type DynamicQuotaOrchestratorWrapper struct {
 // MakeDynamicQuotaOrchestrator creates a DynamicQuotaOrchestrator wrapper.
 func MakeDynamicQuotaOrchestrator(name string) *DynamicQuotaOrchestratorWrapper {
 	return &DynamicQuotaOrchestratorWrapper{
-		DynamicQuotaOrchestrator: kueuealpha.DynamicQuotaOrchestrator{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: kueuealpha.SchemeGroupVersion.String(),
-				Kind:       "DynamicQuotaOrchestrator",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: name,
-			},
-		},
+		APIVersion: kueuealpha.SchemeGroupVersion.String(),
+		Kind:       "DynamicQuotaOrchestrator",
+		Name:       name,
 	}
 }
 
 // Obj returns the DynamicQuotaOrchestrator.
 func (w *DynamicQuotaOrchestratorWrapper) Obj() *kueuealpha.DynamicQuotaOrchestrator {
 	return &w.DynamicQuotaOrchestrator
+}
+
+// Clone returns a deep copy of the wrapper.
+func (w *DynamicQuotaOrchestratorWrapper) Clone() *DynamicQuotaOrchestratorWrapper {
+	return &DynamicQuotaOrchestratorWrapper{DynamicQuotaOrchestrator: *w.DeepCopy()}
+}
+
+// UID sets the UID of the DynamicQuotaOrchestrator.
+func (w *DynamicQuotaOrchestratorWrapper) UID(uid types.UID) *DynamicQuotaOrchestratorWrapper {
+	w.DynamicQuotaOrchestrator.UID = uid
+	return w
+}
+
+// Generation sets the generation of the DynamicQuotaOrchestrator.
+func (w *DynamicQuotaOrchestratorWrapper) Generation(num int64) *DynamicQuotaOrchestratorWrapper {
+	w.ObjectMeta.Generation = num
+	return w
+}
+
+// DeletionTimestamp sets a deletion timestamp on the DynamicQuotaOrchestrator.
+func (w *DynamicQuotaOrchestratorWrapper) DeletionTimestamp(t time.Time) *DynamicQuotaOrchestratorWrapper {
+	w.DynamicQuotaOrchestrator.DeletionTimestamp = new(metav1.NewTime(t).Rfc3339Copy())
+	return w
 }
 
 // DiscoveryProvider adds a CapacityDiscoveryProviderContribution to the DynamicQuotaOrchestrator.
@@ -81,6 +101,18 @@ func (w *DynamicQuotaOrchestratorWrapper) Condition(condition metav1.Condition) 
 	return w
 }
 
+// Conditions replaces status conditions on the DynamicQuotaOrchestrator. An empty list clears them.
+func (w *DynamicQuotaOrchestratorWrapper) Conditions(conditions ...metav1.Condition) *DynamicQuotaOrchestratorWrapper {
+	w.Status.Conditions = conditions
+	return w
+}
+
+// Creation sets the creation timestamp of the DynamicQuotaOrchestrator.
+func (w *DynamicQuotaOrchestratorWrapper) Creation(t time.Time) *DynamicQuotaOrchestratorWrapper {
+	w.CreationTimestamp = metav1.NewTime(t)
+	return w
+}
+
 // CapacityProviderWrapper wraps a CapacityProvider.
 type CapacityProviderWrapper struct {
 	kueuealpha.CapacityProvider
@@ -89,15 +121,9 @@ type CapacityProviderWrapper struct {
 // MakeCapacityProvider creates a CapacityProvider wrapper.
 func MakeCapacityProvider(name string) *CapacityProviderWrapper {
 	return &CapacityProviderWrapper{
-		CapacityProvider: kueuealpha.CapacityProvider{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: kueuealpha.SchemeGroupVersion.String(),
-				Kind:       "CapacityProvider",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: name,
-			},
-		},
+		APIVersion: kueuealpha.SchemeGroupVersion.String(),
+		Kind:       "CapacityProvider",
+		Name:       name,
 	}
 }
 
@@ -186,10 +212,8 @@ type CapacityProviderNormalizedCapacityFlavorWrapper struct {
 // MakeNormalizedCapacityFlavor creates a CapacityProviderNormalizedCapacityFlavor wrapper.
 func MakeNormalizedCapacityFlavor(name string) *CapacityProviderNormalizedCapacityFlavorWrapper {
 	return &CapacityProviderNormalizedCapacityFlavorWrapper{
-		CapacityProviderNormalizedCapacityFlavor: kueuealpha.CapacityProviderNormalizedCapacityFlavor{
-			Name:      kueuealpha.ResourceFlavorReference(name),
-			Resources: corev1.ResourceList{},
-		},
+		Name:      kueuealpha.ResourceFlavorReference(name),
+		Resources: corev1.ResourceList{},
 	}
 }
 
@@ -236,10 +260,8 @@ type EffectiveCapacityFlavorWrapper struct {
 // MakeEffectiveCapacityFlavor creates an EffectiveCapacityFlavor wrapper.
 func MakeEffectiveCapacityFlavor(name string) *EffectiveCapacityFlavorWrapper {
 	return &EffectiveCapacityFlavorWrapper{
-		EffectiveCapacityFlavor: kueuealpha.EffectiveCapacityFlavor{
-			Name:      kueuealpha.ResourceFlavorReference(name),
-			Resources: corev1.ResourceList{},
-		},
+		Name:      kueuealpha.ResourceFlavorReference(name),
+		Resources: corev1.ResourceList{},
 	}
 }
 
