@@ -86,6 +86,7 @@ import (
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	testingjob "sigs.k8s.io/kueue/pkg/util/testingjobs/job"
 	"sigs.k8s.io/kueue/pkg/workload"
+	"sigs.k8s.io/kueue/pkg/workload/concurrentadmission"
 	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
 	workloadfinish "sigs.k8s.io/kueue/pkg/workload/finish"
 	workloadpatching "sigs.k8s.io/kueue/pkg/workload/patching"
@@ -442,6 +443,25 @@ func FinishWorkloads(ctx context.Context, k8sClient client.Client, workloads ...
 	}
 }
 
+// ExpectPodSetAdmittedCount waits until wl is admitted with count pods assigned to the named
+// PodSet, refreshing wl. A partially admitted workload - an elastic job whose scale-up was
+// reduced to fit the available quota - is admitted with fewer pods than it requested, so the
+// assigned count is what says how far the scale-up actually got.
+func ExpectPodSetAdmittedCount(ctx context.Context, k8sClient client.Client, wl *kueue.Workload, podSetName kueue.PodSetReference, count int32) {
+	ginkgo.GinkgoHelper()
+	ExpectWorkloadsToBeAdmitted(ctx, k8sClient, wl)
+	gomega.Eventually(func(g gomega.Gomega) {
+		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).Should(gomega.Succeed())
+		g.Expect(wl.Status.Admission).ShouldNot(gomega.BeNil())
+		assignments := wl.Status.Admission.PodSetAssignments
+		idx := slices.IndexFunc(assignments, func(psa kueue.PodSetAssignment) bool {
+			return psa.Name == podSetName
+		})
+		g.Expect(idx).ShouldNot(gomega.Equal(-1), AssertMsg(fmt.Sprintf("No admitted podSet %q", podSetName), wl))
+		g.Expect(assignments[idx].Count).Should(gomega.Equal(new(count)))
+	}, Timeout, Interval).Should(gomega.Succeed())
+}
+
 func ExpectWorkloadsToHaveQuotaReservation(ctx context.Context, k8sClient client.Client, cqName string, wls ...*kueue.Workload) {
 	ginkgo.GinkgoHelper()
 	wlKeys := workloadKeys(wls)
@@ -664,6 +684,21 @@ func ExpectWorkloadResourceUsage(ctx context.Context, k8sClient client.Client, w
 		usage := assignment.ResourceUsage[resourceName]
 		g.Expect(usage.Cmp(resource.MustParse(expected))).To(gomega.Equal(0))
 	}, Timeout, Interval).Should(gomega.Succeed(), AssertMsg("workload should have resource usage of "+expected+" for "+string(resourceName), &wl))
+}
+
+// SetPodsScheduledCondition simulates a tracker observation in the current admission.
+func SetPodsScheduledCondition(ctx context.Context, k8sClient client.Client, wlKey client.ObjectKey, condition metav1.Condition) {
+	ginkgo.GinkgoHelper()
+	gomega.Eventually(func(g gomega.Gomega) {
+		wl := &kueue.Workload{}
+		g.Expect(k8sClient.Get(ctx, wlKey, wl)).To(gomega.Succeed())
+		admitted := apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadAdmitted)
+		g.Expect(admitted).NotTo(gomega.BeNil())
+		g.Expect(admitted.Status).To(gomega.Equal(metav1.ConditionTrue))
+		g.Expect(RealClock.Now().Truncate(time.Second)).To(gomega.BeTemporally(">", admitted.LastTransitionTime.Time))
+		g.Expect(workload.SetConditionAndUpdate(ctx, k8sClient, wl, kueue.WorkloadPodsScheduled,
+			condition.Status, condition.Reason, condition.Message, "test", RealClock)).To(gomega.Succeed())
+	}, Timeout, Interval).Should(gomega.Succeed())
 }
 
 func ExpectPodsReadyCondition(ctx context.Context, k8sClient client.Client, wlKey client.ObjectKey) {
@@ -1432,6 +1467,13 @@ func ExpectWorkloadsInNamespace(ctx context.Context, k8sClient client.Client, na
 //     non-nil if the function succeeds; otherwise, the test fails before returning.
 func ExpectNewWorkloadSlice(ctx context.Context, k8sClient client.Client, oldWorkload *kueue.Workload) (newWorkload *kueue.Workload) {
 	ginkgo.GinkgoHelper()
+	return ExpectNewWorkloadSliceWithTimeout(ctx, k8sClient, oldWorkload, Timeout)
+}
+
+// ExpectNewWorkloadSliceWithTimeout is like ExpectNewWorkloadSlice, but allows
+// callers to specify how long to wait for the replacement Workload.
+func ExpectNewWorkloadSliceWithTimeout(ctx context.Context, k8sClient client.Client, oldWorkload *kueue.Workload, timeout time.Duration) (newWorkload *kueue.Workload) {
+	ginkgo.GinkgoHelper()
 	gomega.Eventually(func(g gomega.Gomega) {
 		// Reset newWorkload each iteration to ensure the returned value is from
 		// the current poll, not a stale pointer from a previous retry attempt.
@@ -1446,7 +1488,7 @@ func ExpectNewWorkloadSlice(ctx context.Context, k8sClient client.Client, oldWor
 			}
 		}
 		g.Expect(newWorkload).ShouldNot(gomega.BeNil())
-	}, Timeout, Interval).Should(gomega.Succeed(), AssertMsg("No replacement workload slice found for old workload", oldWorkload))
+	}, timeout, Interval).Should(gomega.Succeed(), AssertMsg("No replacement workload slice found for old workload", oldWorkload))
 	return newWorkload
 }
 
@@ -1459,6 +1501,27 @@ func FindNonFinishedWorkloads(workloads []kueue.Workload) []kueue.Workload {
 		}
 	}
 	return active
+}
+
+// FindConcurrentAdmissionVariants returns the subset of workloads that are Concurrent Admission variants.
+func FindConcurrentAdmissionVariants(workloads []kueue.Workload) []kueue.Workload {
+	var variants []kueue.Workload
+	for i := range workloads {
+		if concurrentadmission.IsVariant(&workloads[i]) {
+			variants = append(variants, workloads[i])
+		}
+	}
+	return variants
+}
+
+// FindConcurrentAdmissionParent returns the first non-variant workload, or nil, assuming a ClusterQueue with Concurrent Admission enabled.
+func FindConcurrentAdmissionParent(workloads []kueue.Workload) *kueue.Workload {
+	for i := range workloads {
+		if !concurrentadmission.IsVariant(&workloads[i]) {
+			return &workloads[i]
+		}
+	}
+	return nil
 }
 
 // DeleteWorkloadSliceAndAwaitDeletion deletes the named workload slice and waits

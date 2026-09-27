@@ -48,6 +48,9 @@ const (
 	DeviceClassExtendedResourceNameIndex        = "spec.extendedResourceName"
 	WorkloadExtendedResourceKey                 = "spec.extendedResources"
 	DynamicQuotaOrchestratorCapacityProviderKey = "spec.capacityDiscovery.providers.name"
+	DynamicQuotaOrchestratorIsDistributingKey   = "spec.capacityDistribution.isDistributing"
+	ClusterQueueCohortKey                       = "spec.cohortName"
+	CohortParentKey                             = "spec.parentName"
 	// WorkloadSliceNameKey is an index for pods by their workload slice name annotation.
 	// Used to find pods belonging to an elastic workload slice chain.
 	WorkloadSliceNameKey = "metadata.workloadSliceName"
@@ -202,11 +205,11 @@ func IndexPodWorkloadSliceName(obj client.Object) []string {
 	if !ok {
 		return nil
 	}
-	// Prefer workload slice name annotation for elastic workloads
+	// Prefer workload slice name annotation for elastic workloads.
 	if value, found := pod.Annotations[kueue.WorkloadSliceNameAnnotation]; found {
 		return []string{value}
 	}
-	// Fall back to workload annotation for non-elastic workloads
+	// Fall back to workload annotation for non-elastic workloads.
 	if value, found := pod.Annotations[kueue.WorkloadAnnotation]; found {
 		return []string{value}
 	}
@@ -290,8 +293,54 @@ func IndexDynamicQuotaOrchestratorCapacityProvider(obj client.Object) []string {
 	return providers
 }
 
+// IndexDynamicQuotaOrchestratorIsDistributing indexes DynamicQuotaOrchestrator by whether it has capacity distribution configured.
+func IndexDynamicQuotaOrchestratorIsDistributing(obj client.Object) []string {
+	dqo, ok := obj.(*kueuealpha.DynamicQuotaOrchestrator)
+	if !ok {
+		return nil
+	}
+	if dqo.Spec.CapacityDistribution != nil {
+		return []string{"true"}
+	}
+	return nil
+}
+
+// IndexClusterQueueCohort indexes ClusterQueue by spec.cohortName.
+func IndexClusterQueueCohort(obj client.Object) []string {
+	cq, ok := obj.(*kueue.ClusterQueue)
+	if !ok || cq == nil || cq.Spec.CohortName == "" {
+		return nil
+	}
+	return []string{string(cq.Spec.CohortName)}
+}
+
+// IndexCohortParent indexes Cohort by spec.parentName.
+func IndexCohortParent(obj client.Object) []string {
+	cohort, ok := obj.(*kueue.Cohort)
+	if !ok || cohort == nil || cohort.Spec.ParentName == "" {
+		return nil
+	}
+	return []string{string(cohort.Spec.ParentName)}
+}
+
+type Option func(*options)
+
+type options struct {
+	podWorkloadSliceNameIndex bool
+}
+
+func WithPodWorkloadSliceNameIndex() Option {
+	return func(o *options) {
+		o.podWorkloadSliceNameIndex = true
+	}
+}
+
 // Setup sets the index with the given fields for core apis.
-func Setup(ctx context.Context, indexer client.FieldIndexer) error {
+func Setup(ctx context.Context, indexer client.FieldIndexer, opts ...Option) error {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
 	if err := indexer.IndexField(ctx, &kueue.Workload{}, WorkloadQueueKey, IndexWorkloadQueue); err != nil {
 		return fmt.Errorf("setting index on queue for Workload: %w", err)
 	}
@@ -319,9 +368,7 @@ func Setup(ctx context.Context, indexer client.FieldIndexer) error {
 	if err := indexer.IndexField(ctx, &kueue.Workload{}, OwnerReferenceUID, IndexOwnerUID); err != nil {
 		return fmt.Errorf("setting index on ownerReferences.uid for Workload: %w", err)
 	}
-	// Add pod indexes for elastic-jobs and TAS. Uses workload slice name annotation to support
-	// JobSet and other workloads where pods are not immediate children of the job.
-	if features.Enabled(features.ElasticJobsViaWorkloadSlices) || features.Enabled(features.TopologyAwareScheduling) {
+	if o.podWorkloadSliceNameIndex || features.Enabled(features.ElasticJobsViaWorkloadSlices) || features.Enabled(features.TopologyAwareScheduling) {
 		if err := indexer.IndexField(ctx, &corev1.Pod{}, WorkloadSliceNameKey, IndexPodWorkloadSliceName); err != nil {
 			return fmt.Errorf("setting index on workloadSliceName for Pod: %w", err)
 		}
@@ -344,6 +391,15 @@ func Setup(ctx context.Context, indexer client.FieldIndexer) error {
 	if features.Enabled(features.DynamicQuotaOrchestration) {
 		if err := indexer.IndexField(ctx, &kueuealpha.DynamicQuotaOrchestrator{}, DynamicQuotaOrchestratorCapacityProviderKey, IndexDynamicQuotaOrchestratorCapacityProvider); err != nil {
 			return fmt.Errorf("setting index on capacity provider for DynamicQuotaOrchestrator: %w", err)
+		}
+		if err := indexer.IndexField(ctx, &kueuealpha.DynamicQuotaOrchestrator{}, DynamicQuotaOrchestratorIsDistributingKey, IndexDynamicQuotaOrchestratorIsDistributing); err != nil {
+			return fmt.Errorf("setting index on isDistributing for DynamicQuotaOrchestrator: %w", err)
+		}
+		if err := indexer.IndexField(ctx, &kueue.ClusterQueue{}, ClusterQueueCohortKey, IndexClusterQueueCohort); err != nil {
+			return fmt.Errorf("setting index on cohort for ClusterQueue: %w", err)
+		}
+		if err := indexer.IndexField(ctx, &kueue.Cohort{}, CohortParentKey, IndexCohortParent); err != nil {
+			return fmt.Errorf("setting index on parent for Cohort: %w", err)
 		}
 	}
 	return nil

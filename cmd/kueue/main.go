@@ -68,6 +68,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/controller/jobs"
 	"sigs.k8s.io/kueue/pkg/controller/tas"
 	tasindexer "sigs.k8s.io/kueue/pkg/controller/tas/indexer"
+	"sigs.k8s.io/kueue/pkg/controller/unscheduledpods"
 	"sigs.k8s.io/kueue/pkg/controller/workloaddispatcher"
 	"sigs.k8s.io/kueue/pkg/debugger"
 	"sigs.k8s.io/kueue/pkg/dra"
@@ -257,6 +258,12 @@ func main() {
 	}
 	setupLog.V(2).Info("K8S Client", "qps", *cfg.ClientConnection.QPS, "burst", *cfg.ClientConnection.Burst)
 
+	if leaderElectionEnabled(&cfg) {
+		// Keep the leader election lease client off the shared RateLimiter, so that a
+		// burst of controller requests cannot delay lease renewals past renewDeadline.
+		config.SetLeaderElectionConfig(&options, kubeConfig, &cfg)
+	}
+
 	ctx := ctrl.SetupSignalHandler()
 	// Bootstrap certificates before creating the main manager
 	// This ensures certs are ready and CA bundles are injected into conversion CRDs
@@ -347,12 +354,25 @@ func main() {
 		cacheOptions = append(cacheOptions, schdcache.WithAdmissionFairSharing(cfg.AdmissionFairSharing))
 	}
 	if features.Enabled(features.SchedulerLibraryIntegration) {
-		sim, err := was.NewWASSimulator(ctx, mgr.GetConfig())
+		simulatorFactory, err := was.NewWASSimulatorFactory(ctx, mgr.GetConfig())
 		if err != nil {
 			setupLog.Error(err, "Failed to initialize scheduling simulator")
 			os.Exit(1)
 		}
-		cacheOptions = append(cacheOptions, schdcache.WithSchedulingSimulator(sim))
+		cacheOptions = append(cacheOptions, schdcache.WithSimulatorFactory(simulatorFactory))
+	}
+	if draBackedResources != nil {
+		cacheOptions = append(cacheOptions, schdcache.WithDRABackedResources(draBackedResources))
+	}
+	if features.Enabled(features.KueueDRADeviceFeasibility) {
+		// Only a discovery failure errors. Carrying on unregistered would let a scheduling
+		// cycle block on the informer once discovery recovered.
+		served, err := utildra.RegisterDeviceTaintRuleInformer(ctx, mgr)
+		if err != nil {
+			setupLog.Error(err, "Unable to watch DeviceTaintRules")
+			os.Exit(1)
+		}
+		cacheOptions = append(cacheOptions, schdcache.WithDeviceTaintRules(served))
 	}
 	cCache := schdcache.New(mgr.GetClient(), cacheOptions...)
 
@@ -454,7 +474,11 @@ func setupIndexes(
 	integrationManager *jobframework.IntegrationManager,
 	resourceSliceAPIAvailable bool,
 ) error {
-	err := indexer.Setup(ctx, mgr.GetFieldIndexer())
+	var indexerOpts []indexer.Option
+	if waitforpodsready.PodsScheduledTrackingEnabled(cfg.WaitForPodsReady) {
+		indexerOpts = append(indexerOpts, indexer.WithPodWorkloadSliceNameIndex())
+	}
+	err := indexer.Setup(ctx, mgr.GetFieldIndexer(), indexerOpts...)
 	if err != nil {
 		return err
 	}
@@ -558,6 +582,7 @@ func setupControllers(
 			multikueue.WithDispatcherName(ptr.Deref(cfg.MultiKueue.DispatcherName, configapi.MultiKueueDispatcherModeAllAtOnce)),
 			multikueue.WithClusterProfiles(cfg.MultiKueue.ClusterProfile),
 			multikueue.WithRoleTracker(opts.RoleTracker),
+			multikueue.WithClientConnection(cfg.ClientConnection),
 		); err != nil {
 			return fmt.Errorf("could not setup MultiKueue controller: %w", err)
 		}
@@ -568,13 +593,20 @@ func setupControllers(
 	}
 
 	if features.Enabled(features.TopologyAwareScheduling) {
-		if failedCtrl, err := tas.SetupControllers(mgr, queues, cCache, cfg, opts.RoleTracker); err != nil {
+		if failedCtrl, err := tas.SetupControllers(mgr, queues, cCache, cfg, opts.RoleTracker, tas.WithCustomLabels(opts.CustomLabels)); err != nil {
 			return fmt.Errorf("could not setup TAS controller %s: %w", failedCtrl, err)
 		}
 	}
 
 	if features.Enabled(features.ElasticJobsViaWorkloadSlices) {
-		if failedCtrl, err := elasticjobs.SetupWithManager(mgr, cfg, opts.RoleTracker); err != nil {
+		if failedCtrl, err := elasticjobs.SetupWithManager(mgr, cfg, opts.RoleTracker, opts.CustomLabels); err != nil {
+			return fmt.Errorf("could not setup %s controller: %w", failedCtrl, err)
+		}
+	}
+
+	if waitforpodsready.PodsScheduledTrackingEnabled(cfg.WaitForPodsReady) {
+		tracker := unscheduledpods.NewTracker(mgr.GetClient(), opts.RoleTracker, cfg.WaitForPodsReady)
+		if failedCtrl, err := tracker.SetupWithManager(mgr, cfg); err != nil {
 			return fmt.Errorf("could not setup %s controller: %w", failedCtrl, err)
 		}
 	}
@@ -707,8 +739,12 @@ func setupServerVersionFetcher(mgr ctrl.Manager, kubeConfig *rest.Config) (*kube
 	return serverVersionFetcher, nil
 }
 
+func leaderElectionEnabled(cfg *configapi.Configuration) bool {
+	return cfg.LeaderElection != nil && ptr.Deref(cfg.LeaderElection.LeaderElect, false)
+}
+
 func setupRoleTracker(ctx context.Context, mgr ctrl.Manager, cfg *configapi.Configuration) *roletracker.RoleTracker {
-	if cfg.LeaderElection != nil && ptr.Deref(cfg.LeaderElection.LeaderElect, false) {
+	if leaderElectionEnabled(cfg) {
 		tracker := roletracker.NewRoleTracker(mgr.Elected())
 		go tracker.Start(ctx, setupLog)
 		setupLog.Info("RoleTracker: leader election enabled")

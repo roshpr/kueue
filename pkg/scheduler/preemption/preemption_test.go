@@ -29,6 +29,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/component-base/featuregate"
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -54,6 +55,7 @@ var snapCmpOpts = cmp.Options{
 	// ignore zero values during comparison, as we consider
 	// zero FlavorResource usage to be same as no map entry.
 	cmpopts.IgnoreMapEntries(func(_ resources.FlavorResource, v resources.Amount) bool { return v.CmpInt64(0) == 0 }),
+	cmpopts.IgnoreFields(schdcache.Snapshot{}, "hostnameLeafTASFlavors"),
 	cmp.AllowUnexported(hierarchy.Manager[*schdcache.ClusterQueueSnapshot, *schdcache.CohortSnapshot]{}),
 	cmpopts.IgnoreFields(hierarchy.Manager[*schdcache.ClusterQueueSnapshot, *schdcache.CohortSnapshot]{}, "cohortFactory"),
 	cmpopts.IgnoreFields(schdcache.CohortSnapshot{}, "Cohort"),
@@ -4109,7 +4111,9 @@ func TestPreemption(t *testing.T) {
 				cl := utiltesting.NewClientBuilder().
 					WithLists(&kueue.WorkloadList{Items: tc.admitted}).
 					WithStatusSubresource(&kueue.Workload{}).
-					WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge}).
+					WithInterceptorFuncs(interceptor.Funcs{
+						SubResourceApply: utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration,
+					}).
 					Build()
 
 				cqCache := schdcache.New(cl)
@@ -4139,7 +4143,7 @@ func TestPreemption(t *testing.T) {
 				if err != nil {
 					t.Fatalf("unexpected error while building snapshot: %v", err)
 				}
-				wlInfo := workload.NewInfo(tc.incoming)
+				wlInfo := workload.NewInfo(log, tc.incoming)
 				wlInfo.ClusterQueue = tc.targetCQ
 				targets := preemptor.GetTargets(ctx, *wlInfo, tc.assignment, snapshotWorkingCopy)
 				preempted, failed, err := preemptor.IssuePreemptions(ctx, cqCache, wlInfo, targets, snapshotWorkingCopy.ClusterQueue(wlInfo.ClusterQueue))
@@ -4333,7 +4337,24 @@ func TestPreemptionWhenWorkloadModifiedConcurrently(t *testing.T) {
 									}
 								}
 							}
-							return utiltesting.TreatSSAAsStrategicMerge(ctx, c, subResourceName, obj, patch, opts...)
+							return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+						},
+						SubResourceApply: func(ctx context.Context, c client.Client, subResourceName string, applyConf runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+							if subResourceName == "status" && !patched {
+								patched = true
+								for _, wl := range tc.workloads {
+									// Simulate concurrent modification by another controller
+									wlCopy := wl.DeepCopy()
+									if wlCopy.Labels == nil {
+										wlCopy.Labels = make(map[string]string, 1)
+									}
+									wlCopy.Labels["test.kueue.x-k8s.io/timestamp"] = time.Now().String()
+									if err := c.Update(ctx, wlCopy); err != nil {
+										return err
+									}
+								}
+							}
+							return utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration(ctx, c, subResourceName, applyConf, opts...)
 						},
 					}).
 					Build()
@@ -4356,7 +4377,7 @@ func TestPreemptionWhenWorkloadModifiedConcurrently(t *testing.T) {
 				if err != nil {
 					t.Fatalf("unexpected error while building snapshot: %v", err)
 				}
-				wlInfo := workload.NewInfo(tc.incoming)
+				wlInfo := workload.NewInfo(log, tc.incoming)
 				wlInfo.ClusterQueue = kueue.ClusterQueueReference(cq.Name)
 				targets := preemptor.GetTargets(ctx, *wlInfo, tc.assignment, snapshotWorkingCopy)
 				_, _, err = preemptor.IssuePreemptions(ctx, cqCache, wlInfo, targets, snapshotWorkingCopy.ClusterQueue(wlInfo.ClusterQueue))
@@ -4436,7 +4457,14 @@ func TestIssuePreemptionsCountsFailures(t *testing.T) {
 				if _, ok := obj.(*kueue.Workload); ok && subResourceName == "status" {
 					return errors.New("simulate API server error while preempting workload")
 				}
-				return utiltesting.TreatSSAAsStrategicMerge(ctx, c, subResourceName, obj, patch, opts...)
+				return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+			},
+			SubResourceApply: func(ctx context.Context, c client.Client, subResourceName string, applyConf runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+				patchCount++
+				if subResourceName == "status" {
+					return errors.New("simulate API server error while preempting workload")
+				}
+				return utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration(ctx, c, subResourceName, applyConf, opts...)
 			},
 		}).
 		Build()
@@ -4455,9 +4483,9 @@ func TestIssuePreemptionsCountsFailures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error while building snapshot: %v", err)
 	}
-	wlInfo := workload.NewInfo(incomingWl)
+	wlInfo := workload.NewInfo(log, incomingWl)
 	wlInfo.ClusterQueue = cqName
-	targetInfo := workload.NewInfo(targetWl)
+	targetInfo := workload.NewInfo(log, targetWl)
 	targetInfo.ClusterQueue = cqName
 	targets := []*Target{{
 		WorkloadInfo: targetInfo,
@@ -4555,7 +4583,11 @@ func TestIssuePreemptionsSkipsDuplicate(t *testing.T) {
 					WithInterceptorFuncs(interceptor.Funcs{
 						SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
 							patchCount++
-							return utiltesting.TreatSSAAsStrategicMerge(ctx, c, subResourceName, obj, patch, opts...)
+							return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+						},
+						SubResourceApply: func(ctx context.Context, c client.Client, subResourceName string, applyConf runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+							patchCount++
+							return utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration(ctx, c, subResourceName, applyConf, opts...)
 						},
 					}).
 					Build()
@@ -4573,7 +4605,7 @@ func TestIssuePreemptionsSkipsDuplicate(t *testing.T) {
 				if err != nil {
 					t.Fatalf("unexpected error while building snapshot: %v", err)
 				}
-				wlInfo := workload.NewInfo(tc.incoming)
+				wlInfo := workload.NewInfo(log, tc.incoming)
 				wlInfo.ClusterQueue = kueue.ClusterQueueReference(cq.Name)
 				targets := preemptor.GetTargets(ctx, *wlInfo, tc.assignment, snapshot)
 
@@ -4611,39 +4643,40 @@ func targetKeyReason(key workload.Reference, reason string) string {
 	return fmt.Sprintf("%s:%s", key, reason)
 }
 func TestCandidatesOrdering(t *testing.T) {
+	_, log := utiltesting.ContextWithLog(t)
 	now := time.Now()
 
 	preemptorCq := "preemptor"
 
-	wlLowUsageLq := workload.NewInfo(utiltestingapi.MakeWorkload("low_lq_usage", "").
+	wlLowUsageLq := workload.NewInfo(log, utiltestingapi.MakeWorkload("low_lq_usage", "").
 		Queue("low_usage_lq").
 		ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now).
 		Priority(1).
 		Obj())
 	wlLowUsageLq.LocalQueueFSUsage = new(0.1)
 
-	wlMidUsageLq := workload.NewInfo(utiltestingapi.MakeWorkload("mid_lq_usage", "").
+	wlMidUsageLq := workload.NewInfo(log, utiltestingapi.MakeWorkload("mid_lq_usage", "").
 		Queue("mid_usage_lq").
 		ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now).
 		Priority(10).
 		Obj())
 	wlMidUsageLq.LocalQueueFSUsage = new(0.5)
 
-	wlHighUsageLqDifCQ := workload.NewInfo(utiltestingapi.MakeWorkload("high_lq_usage_different_cq", "").
+	wlHighUsageLqDifCQ := workload.NewInfo(log, utiltestingapi.MakeWorkload("high_lq_usage_different_cq", "").
 		Queue("high_usage_lq_different_cq").
 		ReserveQuotaAt(utiltestingapi.MakeAdmission("different_cq").Obj(), now).
 		Priority(1).
 		Obj())
 	wlHighUsageLqDifCQ.LocalQueueFSUsage = new(1.0)
 
-	wlLowUsageSameNameLq := workload.NewInfo(utiltestingapi.MakeWorkload("low_same_name_lq_usage", "team-a").
+	wlLowUsageSameNameLq := workload.NewInfo(log, utiltestingapi.MakeWorkload("low_same_name_lq_usage", "team-a").
 		Queue("default").
 		ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now).
 		Priority(-10).
 		Obj())
 	wlLowUsageSameNameLq.LocalQueueFSUsage = new(0.1)
 
-	wlHighUsageSameNameLq := workload.NewInfo(utiltestingapi.MakeWorkload("high_same_name_lq_usage", "team-b").
+	wlHighUsageSameNameLq := workload.NewInfo(log, utiltestingapi.MakeWorkload("high_same_name_lq_usage", "team-b").
 		Queue("default").
 		ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now).
 		Priority(10).
@@ -4657,11 +4690,11 @@ func TestCandidatesOrdering(t *testing.T) {
 	}{
 		"workloads sorted by priority": {
 			candidates: []workload.Info{
-				*workload.NewInfo(utiltestingapi.MakeWorkload("high", "").
+				*workload.NewInfo(log, utiltestingapi.MakeWorkload("high", "").
 					ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now).
 					Priority(10).
 					Obj()),
-				*workload.NewInfo(utiltestingapi.MakeWorkload("low", "").
+				*workload.NewInfo(log, utiltestingapi.MakeWorkload("low", "").
 					ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now).
 					Priority(-10).
 					Obj()),
@@ -4670,12 +4703,12 @@ func TestCandidatesOrdering(t *testing.T) {
 		},
 		"workloads sorted by effective priority with boost": {
 			candidates: []workload.Info{
-				*workload.NewInfo(utiltestingapi.MakeWorkload("high-boost", "").
+				*workload.NewInfo(log, utiltestingapi.MakeWorkload("high-boost", "").
 					ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now).
 					Priority(10).
 					Annotation(controllerconstants.PriorityBoostAnnotationKey, "100").
 					Obj()),
-				*workload.NewInfo(utiltestingapi.MakeWorkload("low-boost", "").
+				*workload.NewInfo(log, utiltestingapi.MakeWorkload("low-boost", "").
 					ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now).
 					Priority(10).
 					Annotation(controllerconstants.PriorityBoostAnnotationKey, "5").
@@ -4686,11 +4719,11 @@ func TestCandidatesOrdering(t *testing.T) {
 		},
 		"workload missing priority boost defaults to zero": {
 			candidates: []workload.Info{
-				*workload.NewInfo(utiltestingapi.MakeWorkload("missing-boost", "").
+				*workload.NewInfo(log, utiltestingapi.MakeWorkload("missing-boost", "").
 					ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now).
 					Priority(10).
 					Obj()),
-				*workload.NewInfo(utiltestingapi.MakeWorkload("has-boost", "").
+				*workload.NewInfo(log, utiltestingapi.MakeWorkload("has-boost", "").
 					ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now).
 					Priority(10).
 					Annotation(controllerconstants.PriorityBoostAnnotationKey, "5").
@@ -4701,12 +4734,12 @@ func TestCandidatesOrdering(t *testing.T) {
 		},
 		"invalid priority boost defaults to zero": {
 			candidates: []workload.Info{
-				*workload.NewInfo(utiltestingapi.MakeWorkload("invalid-boost", "").
+				*workload.NewInfo(log, utiltestingapi.MakeWorkload("invalid-boost", "").
 					ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now).
 					Priority(10).
 					Annotation(controllerconstants.PriorityBoostAnnotationKey, "invalid").
 					Obj()),
-				*workload.NewInfo(utiltestingapi.MakeWorkload("valid-boost", "").
+				*workload.NewInfo(log, utiltestingapi.MakeWorkload("valid-boost", "").
 					ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now).
 					Priority(10).
 					Annotation(controllerconstants.PriorityBoostAnnotationKey, "5").
@@ -4717,11 +4750,11 @@ func TestCandidatesOrdering(t *testing.T) {
 		},
 		"evicted workload first": {
 			candidates: []workload.Info{
-				*workload.NewInfo(utiltestingapi.MakeWorkload("other", "").
+				*workload.NewInfo(log, utiltestingapi.MakeWorkload("other", "").
 					ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now).
 					Priority(10).
 					Obj()),
-				*workload.NewInfo(utiltestingapi.MakeWorkload("evicted", "").
+				*workload.NewInfo(log, utiltestingapi.MakeWorkload("evicted", "").
 					Condition(metav1.Condition{
 						Type:               kueue.WorkloadEvicted,
 						Status:             metav1.ConditionTrue,
@@ -4733,11 +4766,11 @@ func TestCandidatesOrdering(t *testing.T) {
 		},
 		"workload from different CQ first": {
 			candidates: []workload.Info{
-				*workload.NewInfo(utiltestingapi.MakeWorkload("preemptorCq", "").
+				*workload.NewInfo(log, utiltestingapi.MakeWorkload("preemptorCq", "").
 					ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now).
 					Priority(10).
 					Obj()),
-				*workload.NewInfo(utiltestingapi.MakeWorkload("other", "").
+				*workload.NewInfo(log, utiltestingapi.MakeWorkload("other", "").
 					ReserveQuotaAt(utiltestingapi.MakeAdmission("other").Obj(), now).
 					Priority(10).
 					Obj()),
@@ -4746,13 +4779,13 @@ func TestCandidatesOrdering(t *testing.T) {
 		},
 		"old workloads last": {
 			candidates: []workload.Info{
-				*workload.NewInfo(utiltestingapi.MakeWorkload("older", "").
+				*workload.NewInfo(log, utiltestingapi.MakeWorkload("older", "").
 					ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now.Add(-time.Second)).
 					Obj()),
-				*workload.NewInfo(utiltestingapi.MakeWorkload("younger", "").
+				*workload.NewInfo(log, utiltestingapi.MakeWorkload("younger", "").
 					ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now.Add(time.Second)).
 					Obj()),
-				*workload.NewInfo(utiltestingapi.MakeWorkload("current", "").
+				*workload.NewInfo(log, utiltestingapi.MakeWorkload("current", "").
 					ReserveQuotaAt(utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(preemptorCq)).Obj(), now).
 					Obj()),
 			},
@@ -4783,7 +4816,6 @@ func TestCandidatesOrdering(t *testing.T) {
 			featureGates:   map[featuregate.Feature]bool{features.AdmissionFairSharing: true},
 		}}
 
-	_, log := utiltesting.ContextWithLog(t)
 	for _, tc := range cases {
 		features.SetFeatureGatesDuringTest(t, tc.featureGates)
 		slices.SortFunc(tc.candidates, func(a, b workload.Info) int {
@@ -4821,15 +4853,15 @@ func TestPreemptionMessage(t *testing.T) {
 			want:      "Preempted to accommodate a workload (UID: UNKNOWN, JobUID: UNKNOWN) due to UNKNOWN; preemptor path: UNKNOWN; preemptee path: UNKNOWN",
 		},
 		{
-			preemptor: &kueue.Workload{ObjectMeta: metav1.ObjectMeta{UID: "uid"}},
+			preemptor: &kueue.Workload{UID: "uid"},
 			want:      "Preempted to accommodate a workload (UID: uid, JobUID: UNKNOWN) due to UNKNOWN; preemptor path: UNKNOWN; preemptee path: UNKNOWN",
 		},
 		{
-			preemptor: &kueue.Workload{ObjectMeta: metav1.ObjectMeta{UID: "uid", Labels: map[string]string{controllerconstants.JobUIDLabel: "juid"}}},
+			preemptor: &kueue.Workload{UID: "uid", Labels: map[string]string{controllerconstants.JobUIDLabel: "juid"}},
 			want:      "Preempted to accommodate a workload (UID: uid, JobUID: juid) due to UNKNOWN; preemptor path: UNKNOWN; preemptee path: UNKNOWN",
 		},
 		{
-			preemptor:     &kueue.Workload{ObjectMeta: metav1.ObjectMeta{UID: "uid", Labels: map[string]string{controllerconstants.JobUIDLabel: "juid"}}},
+			preemptor:     &kueue.Workload{UID: "uid", Labels: map[string]string{controllerconstants.JobUIDLabel: "juid"}},
 			reason:        kueue.InClusterQueueReason,
 			preemptorPath: "/a",
 			preempteePath: "/b",
@@ -4872,10 +4904,8 @@ func TestPriorityInfo(t *testing.T) {
 		{
 			name: "workload with priority and positive boost",
 			wl: &kueue.Workload{
-				ObjectMeta: metav1.ObjectMeta{
-					Annotations: map[string]string{controllerconstants.PriorityBoostAnnotationKey: "50"},
-				},
-				Spec: kueue.WorkloadSpec{Priority: new(int32(200))},
+				Annotations: map[string]string{controllerconstants.PriorityBoostAnnotationKey: "50"},
+				Spec:        kueue.WorkloadSpec{Priority: new(int32(200))},
 			},
 			wantEffective: 250,
 			wantBase:      200,
@@ -4885,10 +4915,8 @@ func TestPriorityInfo(t *testing.T) {
 		{
 			name: "workload with priority and negative boost",
 			wl: &kueue.Workload{
-				ObjectMeta: metav1.ObjectMeta{
-					Annotations: map[string]string{controllerconstants.PriorityBoostAnnotationKey: "-30"},
-				},
-				Spec: kueue.WorkloadSpec{Priority: new(int32(100))},
+				Annotations: map[string]string{controllerconstants.PriorityBoostAnnotationKey: "-30"},
+				Spec:        kueue.WorkloadSpec{Priority: new(int32(100))},
 			},
 			wantEffective: 70,
 			wantBase:      100,
@@ -4898,10 +4926,8 @@ func TestPriorityInfo(t *testing.T) {
 		{
 			name: "workload with invalid boost annotation falls back to zero",
 			wl: &kueue.Workload{
-				ObjectMeta: metav1.ObjectMeta{
-					Annotations: map[string]string{controllerconstants.PriorityBoostAnnotationKey: "not-a-number"},
-				},
-				Spec: kueue.WorkloadSpec{Priority: new(int32(100))},
+				Annotations: map[string]string{controllerconstants.PriorityBoostAnnotationKey: "not-a-number"},
+				Spec:        kueue.WorkloadSpec{Priority: new(int32(100))},
 			},
 			wantEffective: 100,
 			wantBase:      100,
@@ -4911,10 +4937,8 @@ func TestPriorityInfo(t *testing.T) {
 		{
 			name: "workload with effective priority above int32 max",
 			wl: &kueue.Workload{
-				ObjectMeta: metav1.ObjectMeta{
-					Annotations: map[string]string{controllerconstants.PriorityBoostAnnotationKey: "1"},
-				},
-				Spec: kueue.WorkloadSpec{Priority: new(int32(math.MaxInt32))},
+				Annotations: map[string]string{controllerconstants.PriorityBoostAnnotationKey: "1"},
+				Spec:        kueue.WorkloadSpec{Priority: new(int32(math.MaxInt32))},
 			},
 			wantEffective: int64(math.MaxInt32) + 1,
 			wantBase:      math.MaxInt32,
@@ -4924,10 +4948,8 @@ func TestPriorityInfo(t *testing.T) {
 		{
 			name: "feature disabled: boost annotation ignored",
 			wl: &kueue.Workload{
-				ObjectMeta: metav1.ObjectMeta{
-					Annotations: map[string]string{controllerconstants.PriorityBoostAnnotationKey: "50"},
-				},
-				Spec: kueue.WorkloadSpec{Priority: new(int32(100))},
+				Annotations: map[string]string{controllerconstants.PriorityBoostAnnotationKey: "50"},
+				Spec:        kueue.WorkloadSpec{Priority: new(int32(100))},
 			},
 			wantEffective: 100,
 			wantBase:      100,
