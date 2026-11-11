@@ -23,7 +23,10 @@ import (
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	componentconfigv1alpha1 "k8s.io/component-base/config/v1alpha1"
+
+	"sigs.k8s.io/kueue/pkg/features"
 )
 
 const (
@@ -33,8 +36,8 @@ const (
 	overwriteMetricBindAddress                   = ":38081"
 	overwriteHealthProbeBindAddress              = ":38080"
 	overwriteLeaderElectionID                    = "foo.kueue.x-k8s.io"
-	expectedDefaultClientConnectionQPS   float32 = 300.0
-	expectedDefaultClientConnectionBurst int32   = 500
+	expectedDefaultClientConnectionQPS   float32 = 1000.0
+	expectedDefaultClientConnectionBurst int32   = 1000
 )
 
 func TestSetDefaults_Configuration(t *testing.T) {
@@ -44,7 +47,7 @@ func TestSetDefaults_Configuration(t *testing.T) {
 			LeaseDuration: metav1.Duration{Duration: DefaultLeaderElectionLeaseDuration},
 			RenewDeadline: metav1.Duration{Duration: DefaultLeaderElectionRenewDeadline},
 			RetryPeriod:   metav1.Duration{Duration: DefaultLeaderElectionRetryPeriod},
-			ResourceLock:  "leases",
+			ResourceLock:  resourcelock.LeasesResourceLock,
 			ResourceName:  "c1f6bfd2.kueue.x-k8s.io",
 		},
 		Webhook: ControllerWebhook{
@@ -110,6 +113,9 @@ func TestSetDefaults_Configuration(t *testing.T) {
 		RecoveryTimeout: &metav1.Duration{
 			Duration: 30 * time.Minute,
 		},
+		MaxTimeoutOnWorkload: &metav1.Duration{
+			Duration: DefaultMaxTimeoutOnWorkload,
+		},
 		RequeuingStrategy: &RequeuingStrategy{
 			Timestamp:          new(EvictionTimestamp),
 			BackoffBaseSeconds: new(int32(DefaultRequeuingBackoffBaseSeconds)),
@@ -131,9 +137,8 @@ func TestSetDefaults_Configuration(t *testing.T) {
 				},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
-				Namespace:            new(DefaultNamespace),
-				ControllerManager:    defaultCtrlManagerConfigurationSpec,
+				Namespace:         new(DefaultNamespace),
+				ControllerManager: defaultCtrlManagerConfigurationSpec,
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
 				},
@@ -147,40 +152,35 @@ func TestSetDefaults_Configuration(t *testing.T) {
 		},
 		"defaulting ControllerManager": {
 			original: &Configuration{
-				ControllerManager: ControllerManager{
-					LeaderElection: &componentconfigv1alpha1.LeaderElectionConfiguration{
-						LeaderElect: new(true),
-					},
+				LeaderElection: &componentconfigv1alpha1.LeaderElectionConfiguration{
+					LeaderElect: new(true),
 				},
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
 				},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
-				Namespace:            new(DefaultNamespace),
-				ControllerManager: ControllerManager{
-					Webhook: ControllerWebhook{
-						Port:    new(DefaultWebhookPort),
-						CertDir: DefaultWebhookCertDir,
+				Namespace: new(DefaultNamespace),
+				Webhook: ControllerWebhook{
+					Port:    new(DefaultWebhookPort),
+					CertDir: DefaultWebhookCertDir,
+				},
+				Metrics: ControllerMetrics{
+					BindAddress: DefaultMetricsBindAddress,
+					LocalQueueMetrics: &LocalQueueMetrics{
+						Enable: true,
 					},
-					Metrics: ControllerMetrics{
-						BindAddress: DefaultMetricsBindAddress,
-						LocalQueueMetrics: &LocalQueueMetrics{
-							Enable: true,
-						},
-					},
-					Health: ControllerHealth{
-						HealthProbeBindAddress: DefaultHealthProbeBindAddress,
-					},
-					LeaderElection: &componentconfigv1alpha1.LeaderElectionConfiguration{
-						LeaderElect:   new(true),
-						LeaseDuration: metav1.Duration{Duration: DefaultLeaderElectionLeaseDuration},
-						RenewDeadline: metav1.Duration{Duration: DefaultLeaderElectionRenewDeadline},
-						RetryPeriod:   metav1.Duration{Duration: DefaultLeaderElectionRetryPeriod},
-						ResourceLock:  "leases",
-						ResourceName:  DefaultLeaderElectionID,
-					},
+				},
+				Health: ControllerHealth{
+					HealthProbeBindAddress: DefaultHealthProbeBindAddress,
+				},
+				LeaderElection: &componentconfigv1alpha1.LeaderElectionConfiguration{
+					LeaderElect:   new(true),
+					LeaseDuration: metav1.Duration{Duration: DefaultLeaderElectionLeaseDuration},
+					RenewDeadline: metav1.Duration{Duration: DefaultLeaderElectionRenewDeadline},
+					RetryPeriod:   metav1.Duration{Duration: DefaultLeaderElectionRetryPeriod},
+					ResourceLock:  "leases",
+					ResourceName:  DefaultLeaderElectionID,
 				},
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
@@ -195,28 +195,27 @@ func TestSetDefaults_Configuration(t *testing.T) {
 		},
 		"should not default ControllerManager": {
 			original: &Configuration{
-				ControllerManager: ControllerManager{
-					Webhook: ControllerWebhook{
-						Port:    new(overwriteWebhookPort),
-						CertDir: overwriteWebhookCertDir,
+				Webhook: ControllerWebhook{
+					Port:    new(overwriteWebhookPort),
+					CertDir: overwriteWebhookCertDir,
+				},
+				Metrics: ControllerMetrics{
+					AccessControlMode: new(MetricsAccessControlModeNone),
+					BindAddress:       overwriteMetricBindAddress,
+					LocalQueueMetrics: &LocalQueueMetrics{
+						Enable: false,
 					},
-					Metrics: ControllerMetrics{
-						BindAddress: overwriteMetricBindAddress,
-						LocalQueueMetrics: &LocalQueueMetrics{
-							Enable: false,
-						},
-					},
-					Health: ControllerHealth{
-						HealthProbeBindAddress: overwriteHealthProbeBindAddress,
-					},
-					LeaderElection: &componentconfigv1alpha1.LeaderElectionConfiguration{
-						LeaderElect:   new(true),
-						LeaseDuration: metav1.Duration{Duration: DefaultLeaderElectionLeaseDuration},
-						RenewDeadline: metav1.Duration{Duration: DefaultLeaderElectionRenewDeadline},
-						RetryPeriod:   metav1.Duration{Duration: DefaultLeaderElectionRetryPeriod},
-						ResourceLock:  "leases",
-						ResourceName:  overwriteLeaderElectionID,
-					},
+				},
+				Health: ControllerHealth{
+					HealthProbeBindAddress: overwriteHealthProbeBindAddress,
+				},
+				LeaderElection: &componentconfigv1alpha1.LeaderElectionConfiguration{
+					LeaderElect:   new(true),
+					LeaseDuration: metav1.Duration{Duration: DefaultLeaderElectionLeaseDuration},
+					RenewDeadline: metav1.Duration{Duration: DefaultLeaderElectionRenewDeadline},
+					RetryPeriod:   metav1.Duration{Duration: DefaultLeaderElectionRetryPeriod},
+					ResourceLock:  "leases",
+					ResourceName:  overwriteLeaderElectionID,
 				},
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
@@ -225,30 +224,28 @@ func TestSetDefaults_Configuration(t *testing.T) {
 				VisibilityServer: defaultVisibilityServer,
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
-				Namespace:            new(DefaultNamespace),
-				ControllerManager: ControllerManager{
-					Webhook: ControllerWebhook{
-						Port:    new(overwriteWebhookPort),
-						CertDir: overwriteWebhookCertDir,
+				Namespace: new(DefaultNamespace),
+				Webhook: ControllerWebhook{
+					Port:    new(overwriteWebhookPort),
+					CertDir: overwriteWebhookCertDir,
+				},
+				Metrics: ControllerMetrics{
+					AccessControlMode: new(MetricsAccessControlModeNone),
+					BindAddress:       overwriteMetricBindAddress,
+					LocalQueueMetrics: &LocalQueueMetrics{
+						Enable: false,
 					},
-					Metrics: ControllerMetrics{
-						BindAddress: overwriteMetricBindAddress,
-						LocalQueueMetrics: &LocalQueueMetrics{
-							Enable: false,
-						},
-					},
-					Health: ControllerHealth{
-						HealthProbeBindAddress: overwriteHealthProbeBindAddress,
-					},
-					LeaderElection: &componentconfigv1alpha1.LeaderElectionConfiguration{
-						LeaderElect:   new(true),
-						LeaseDuration: metav1.Duration{Duration: DefaultLeaderElectionLeaseDuration},
-						RenewDeadline: metav1.Duration{Duration: DefaultLeaderElectionRenewDeadline},
-						RetryPeriod:   metav1.Duration{Duration: DefaultLeaderElectionRetryPeriod},
-						ResourceLock:  "leases",
-						ResourceName:  overwriteLeaderElectionID,
-					},
+				},
+				Health: ControllerHealth{
+					HealthProbeBindAddress: overwriteHealthProbeBindAddress,
+				},
+				LeaderElection: &componentconfigv1alpha1.LeaderElectionConfiguration{
+					LeaderElect:   new(true),
+					LeaseDuration: metav1.Duration{Duration: DefaultLeaderElectionLeaseDuration},
+					RenewDeadline: metav1.Duration{Duration: DefaultLeaderElectionRenewDeadline},
+					RetryPeriod:   metav1.Duration{Duration: DefaultLeaderElectionRetryPeriod},
+					ResourceLock:  "leases",
+					ResourceName:  overwriteLeaderElectionID,
 				},
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
@@ -263,40 +260,35 @@ func TestSetDefaults_Configuration(t *testing.T) {
 		},
 		"should not set LeaderElectionID": {
 			original: &Configuration{
-				ControllerManager: ControllerManager{
-					LeaderElection: &componentconfigv1alpha1.LeaderElectionConfiguration{
-						LeaderElect: new(false),
-					},
+				LeaderElection: &componentconfigv1alpha1.LeaderElectionConfiguration{
+					LeaderElect: new(false),
 				},
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
 				},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
-				Namespace:            new(DefaultNamespace),
-				ControllerManager: ControllerManager{
-					Webhook: ControllerWebhook{
-						Port:    new(DefaultWebhookPort),
-						CertDir: DefaultWebhookCertDir,
+				Namespace: new(DefaultNamespace),
+				Webhook: ControllerWebhook{
+					Port:    new(DefaultWebhookPort),
+					CertDir: DefaultWebhookCertDir,
+				},
+				Metrics: ControllerMetrics{
+					BindAddress: DefaultMetricsBindAddress,
+					LocalQueueMetrics: &LocalQueueMetrics{
+						Enable: true,
 					},
-					Metrics: ControllerMetrics{
-						BindAddress: DefaultMetricsBindAddress,
-						LocalQueueMetrics: &LocalQueueMetrics{
-							Enable: true,
-						},
-					},
-					Health: ControllerHealth{
-						HealthProbeBindAddress: DefaultHealthProbeBindAddress,
-					},
-					LeaderElection: &componentconfigv1alpha1.LeaderElectionConfiguration{
-						LeaderElect:   new(false),
-						LeaseDuration: metav1.Duration{Duration: DefaultLeaderElectionLeaseDuration},
-						RenewDeadline: metav1.Duration{Duration: DefaultLeaderElectionRenewDeadline},
-						RetryPeriod:   metav1.Duration{Duration: DefaultLeaderElectionRetryPeriod},
-						ResourceLock:  "leases",
-						ResourceName:  "c1f6bfd2.kueue.x-k8s.io",
-					},
+				},
+				Health: ControllerHealth{
+					HealthProbeBindAddress: DefaultHealthProbeBindAddress,
+				},
+				LeaderElection: &componentconfigv1alpha1.LeaderElectionConfiguration{
+					LeaderElect:   new(false),
+					LeaseDuration: metav1.Duration{Duration: DefaultLeaderElectionLeaseDuration},
+					RenewDeadline: metav1.Duration{Duration: DefaultLeaderElectionRenewDeadline},
+					RetryPeriod:   metav1.Duration{Duration: DefaultLeaderElectionRetryPeriod},
+					ResourceLock:  "leases",
+					ResourceName:  "c1f6bfd2.kueue.x-k8s.io",
 				},
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
@@ -314,9 +306,8 @@ func TestSetDefaults_Configuration(t *testing.T) {
 				Namespace: new(overwriteNamespace),
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
-				Namespace:            new(overwriteNamespace),
-				ControllerManager:    defaultCtrlManagerConfigurationSpec,
+				Namespace:         new(overwriteNamespace),
+				ControllerManager: defaultCtrlManagerConfigurationSpec,
 				InternalCertManagement: &InternalCertManagement{
 					Enable:             new(true),
 					WebhookServiceName: new(DefaultWebhookServiceName),
@@ -338,9 +329,8 @@ func TestSetDefaults_Configuration(t *testing.T) {
 				},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
-				Namespace:            new(overwriteNamespace),
-				ControllerManager:    defaultCtrlManagerConfigurationSpec,
+				Namespace:         new(overwriteNamespace),
+				ControllerManager: defaultCtrlManagerConfigurationSpec,
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
 				},
@@ -364,9 +354,8 @@ func TestSetDefaults_Configuration(t *testing.T) {
 				},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
-				Namespace:            new(overwriteNamespace),
-				ControllerManager:    defaultCtrlManagerConfigurationSpec,
+				Namespace:         new(overwriteNamespace),
+				ControllerManager: defaultCtrlManagerConfigurationSpec,
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
 				},
@@ -390,9 +379,8 @@ func TestSetDefaults_Configuration(t *testing.T) {
 				ClientConnection: &ClientConnection{},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
-				Namespace:            new(overwriteNamespace),
-				ControllerManager:    defaultCtrlManagerConfigurationSpec,
+				Namespace:         new(overwriteNamespace),
+				ControllerManager: defaultCtrlManagerConfigurationSpec,
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
 				},
@@ -412,7 +400,6 @@ func TestSetDefaults_Configuration(t *testing.T) {
 				},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
 				WaitForPodsReady: &WaitForPodsReady{
 					Timeout: metav1.Duration{
 						Duration: 30 * time.Minute,
@@ -420,6 +407,9 @@ func TestSetDefaults_Configuration(t *testing.T) {
 					BlockAdmission: new(false),
 					RecoveryTimeout: &metav1.Duration{
 						Duration: 30 * time.Minute,
+					},
+					MaxTimeoutOnWorkload: &metav1.Duration{
+						Duration: DefaultMaxTimeoutOnWorkload,
 					},
 					RequeuingStrategy: &RequeuingStrategy{
 						Timestamp:          new(EvictionTimestamp),
@@ -449,11 +439,13 @@ func TestSetDefaults_Configuration(t *testing.T) {
 				},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
 				WaitForPodsReady: &WaitForPodsReady{
 					Timeout:         customTimeout,
 					BlockAdmission:  new(false),
 					RecoveryTimeout: &customTimeout,
+					MaxTimeoutOnWorkload: &metav1.Duration{
+						Duration: DefaultMaxTimeoutOnWorkload,
+					},
 					RequeuingStrategy: &RequeuingStrategy{
 						Timestamp:          new(EvictionTimestamp),
 						BackoffBaseSeconds: new(int32(DefaultRequeuingBackoffBaseSeconds)),
@@ -476,23 +468,30 @@ func TestSetDefaults_Configuration(t *testing.T) {
 			original: &Configuration{
 				WaitForPodsReady: &WaitForPodsReady{
 					Timeout: podsReadyTimeoutOverwrite,
+					MaxTimeoutOnWorkload: &metav1.Duration{
+						Duration: 1 * time.Hour,
+					},
 					RequeuingStrategy: &RequeuingStrategy{
 						Timestamp:          new(CreationTimestamp),
 						BackoffBaseSeconds: new(int32(63)),
 						BackoffMaxSeconds:  new(int32(1800)),
 					},
-					RecoveryTimeout: &metav1.Duration{Duration: time.Minute},
+					RecoveryTimeout:    &metav1.Duration{Duration: time.Minute},
+					UnscheduledTimeout: &metav1.Duration{Duration: 30 * time.Second},
 				},
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
 				},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
 				WaitForPodsReady: &WaitForPodsReady{
-					BlockAdmission:  new(false),
-					Timeout:         podsReadyTimeoutOverwrite,
-					RecoveryTimeout: &metav1.Duration{Duration: time.Minute},
+					BlockAdmission:     new(false),
+					Timeout:            podsReadyTimeoutOverwrite,
+					RecoveryTimeout:    &metav1.Duration{Duration: time.Minute},
+					UnscheduledTimeout: &metav1.Duration{Duration: 30 * time.Second},
+					MaxTimeoutOnWorkload: &metav1.Duration{
+						Duration: 1 * time.Hour,
+					},
 					RequeuingStrategy: &RequeuingStrategy{
 						Timestamp:          new(CreationTimestamp),
 						BackoffBaseSeconds: new(int32(63)),
@@ -522,11 +521,13 @@ func TestSetDefaults_Configuration(t *testing.T) {
 				},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
 				WaitForPodsReady: &WaitForPodsReady{
 					Timeout:         customTimeout,
 					BlockAdmission:  new(false),
 					RecoveryTimeout: &metav1.Duration{Duration: 0},
+					MaxTimeoutOnWorkload: &metav1.Duration{
+						Duration: DefaultMaxTimeoutOnWorkload,
+					},
 					RequeuingStrategy: &RequeuingStrategy{
 						Timestamp:          new(EvictionTimestamp),
 						BackoffBaseSeconds: new(int32(DefaultRequeuingBackoffBaseSeconds)),
@@ -555,9 +556,8 @@ func TestSetDefaults_Configuration(t *testing.T) {
 				},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
-				Namespace:            new(DefaultNamespace),
-				ControllerManager:    defaultCtrlManagerConfigurationSpec,
+				Namespace:         new(DefaultNamespace),
+				ControllerManager: defaultCtrlManagerConfigurationSpec,
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
 				},
@@ -584,9 +584,8 @@ func TestSetDefaults_Configuration(t *testing.T) {
 				},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
-				Namespace:            new(DefaultNamespace),
-				ControllerManager:    defaultCtrlManagerConfigurationSpec,
+				Namespace:         new(DefaultNamespace),
+				ControllerManager: defaultCtrlManagerConfigurationSpec,
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
 				},
@@ -619,9 +618,8 @@ func TestSetDefaults_Configuration(t *testing.T) {
 				},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
-				Namespace:            new(DefaultNamespace),
-				ControllerManager:    defaultCtrlManagerConfigurationSpec,
+				Namespace:         new(DefaultNamespace),
+				ControllerManager: defaultCtrlManagerConfigurationSpec,
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
 				},
@@ -649,9 +647,8 @@ func TestSetDefaults_Configuration(t *testing.T) {
 				},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
-				Namespace:            new(DefaultNamespace),
-				ControllerManager:    defaultCtrlManagerConfigurationSpec,
+				Namespace:         new(DefaultNamespace),
+				ControllerManager: defaultCtrlManagerConfigurationSpec,
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
 				},
@@ -681,9 +678,8 @@ func TestSetDefaults_Configuration(t *testing.T) {
 				},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
-				Namespace:            new(DefaultNamespace),
-				ControllerManager:    defaultCtrlManagerConfigurationSpec,
+				Namespace:         new(DefaultNamespace),
+				ControllerManager: defaultCtrlManagerConfigurationSpec,
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
 				},
@@ -715,9 +711,8 @@ func TestSetDefaults_Configuration(t *testing.T) {
 				},
 			},
 			want: &Configuration{
-				QuotaReleaseStrategy: new(QuotaReleaseOnTerminating),
-				Namespace:            new(DefaultNamespace),
-				ControllerManager:    defaultCtrlManagerConfigurationSpec,
+				Namespace:         new(DefaultNamespace),
+				ControllerManager: defaultCtrlManagerConfigurationSpec,
 				InternalCertManagement: &InternalCertManagement{
 					Enable: new(false),
 				},
@@ -743,6 +738,31 @@ func TestSetDefaults_Configuration(t *testing.T) {
 			SetDefaults_Configuration(tc.original)
 			if diff := cmp.Diff(tc.want, tc.original); diff != "" {
 				t.Errorf("unexpected error (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestSetDefaults_ConfigurationMetricsAccessControl(t *testing.T) {
+	cases := map[string]struct {
+		gate bool
+		mode *MetricsAccessControlMode
+		want *MetricsAccessControlMode
+	}{
+		"unset without gate":              {},
+		"unset with gate":                 {gate: true, want: new(MetricsAccessControlModeDelegated)},
+		"explicit delegated without gate": {mode: new(MetricsAccessControlModeDelegated), want: new(MetricsAccessControlModeDelegated)},
+		"explicit none without gate":      {mode: new(MetricsAccessControlModeNone), want: new(MetricsAccessControlModeNone)},
+		"explicit none with gate":         {gate: true, mode: new(MetricsAccessControlModeNone), want: new(MetricsAccessControlModeNone)},
+		"explicit empty with gate":        {gate: true, mode: new(MetricsAccessControlMode("")), want: new(MetricsAccessControlMode(""))},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.MetricsAccessControl, tc.gate)
+			cfg := &Configuration{Metrics: ControllerMetrics{AccessControlMode: tc.mode}}
+			SetDefaults_Configuration(cfg)
+			if diff := cmp.Diff(tc.want, cfg.Metrics.AccessControlMode); diff != "" {
+				t.Errorf("unexpected metrics access control mode (-want,+got):\n%s", diff)
 			}
 		})
 	}

@@ -14,11 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-export KUSTOMIZE="$ROOT_DIR"/bin/kustomize
-export GINKGO="$ROOT_DIR"/bin/ginkgo
-export KIND="$ROOT_DIR"/bin/kind
-export YQ="$ROOT_DIR"/bin/yq
-export HELM="$ROOT_DIR"/bin/helm
+export E2E_BIN_DIR="${E2E_BIN_DIR:-${ROOT_DIR}/bin}"
+export KUSTOMIZE="${E2E_BIN_DIR}/kustomize"
+export GINKGO="${E2E_BIN_DIR}/ginkgo"
+export KIND="${E2E_BIN_DIR}/kind"
+export YQ="${E2E_BIN_DIR}/yq"
+export HELM="${E2E_BIN_DIR}/helm"
+export PATH="${E2E_BIN_DIR}:$PATH"
 
 # GOTRACEBACK=system asks the Go runtime to include runtime-internal goroutines when a
 # subprocess spawned below (e.g. `go vet`/`go build` during `ginkgo run` compilation)
@@ -52,9 +54,22 @@ export E2E_SKIP_IMAGE_RELOAD="${E2E_SKIP_IMAGE_RELOAD:-false}"
 
 export KIND_VERSION="${E2E_KIND_VERSION#kindest/node:v}"
 
+# The registry saying the tag will never appear. Kept separate from
+# E2E_NON_RETRIABLE_IMAGE_ERRORS, whose bare `not found` a registry's own 404
+# page also satisfies.
+export E2E_MISSING_IMAGE_ERRORS="no such manifest|manifest (unknown|for .* not found)|repository does not exist"
+
 # Non-retriable: missing image, denied access, or a full disk.
-# Shared by `e2e_docker_pull_if_needed` and `e2e_docker_manifest_available` below.
-export E2E_NON_RETRIABLE_IMAGE_ERRORS="no such manifest|manifest (unknown|for .* not found)|repository does not exist|not found|pull access denied|unauthorized|denied: requested access|no space left on device"
+# Shared by `e2e_image_pull_is_retriable` and `e2e_docker_manifest_available` below.
+export E2E_NON_RETRIABLE_IMAGE_ERRORS="${E2E_MISSING_IMAGE_ERRORS}|not found|pull access denied|unauthorized: authentication required|unauthorized: access to the requested resource is not authorized|denied: requested access|no space left on device"
+
+# Retriable: transport-level failures reaching a git remote.
+# Composed from git's transport error strings; extend it as CI hits new ones.
+export E2E_RETRIABLE_GIT_ERRORS="could not resolve host|connection refused|connection reset by peer|connection timed out|operation timed out|rpc failed|early eof|remote end hung up unexpectedly|gnutls_handshake|ssl_error|tls handshake timeout|500 internal server error|502 bad gateway|503 service unavailable"
+
+# Retriable: registry and module proxy failures during an image build.
+# Duplicates IMAGE_BUILD_RETRIABLE_ERRORS, which Make does not export to this script.
+export E2E_RETRIABLE_IMAGE_BUILD_ERRORS="context deadline exceeded|unexpected status from HEAD request to .*: 401 Unauthorized|unexpected status from POST request to .*: 502 Bad Gateway|connection reset by peer|too ?many ?requests|ref .* locked for .*: unavailable|tls handshake timeout|stream error: stream ID [0-9]+; INTERNAL_ERROR|http2: server sent GOAWAY|500 Internal Server Error|i/o timeout"
 
 function build_kind_node_image {
     if [[ "$E2E_KIND_VERSION" != kindest/node:v* ]]; then
@@ -70,7 +85,7 @@ function build_kind_node_image {
     fi
 
     echo "Building kind node image: $E2E_KIND_VERSION (K8s v$KIND_VERSION)"
-    "${ROOT_DIR}/hack/testing/retry.sh" --attempts 7 --delay 2 --exponential --stream -- \
+    "${ROOT_DIR}/hack/testing/retry.sh" --stream -- \
         "$KIND" build node-image "v$KIND_VERSION" --image "$E2E_KIND_VERSION"
 }
 
@@ -81,10 +96,72 @@ function e2e_is_truthy {
     esac
 }
 
-# Returns success when the kind node Kubernetes version supports image volumes,
-# which are Beta and enabled by default from v1.35.
-function e2e_supports_image_volume {
-    [[ "$(printf '%s\n' "1.35.0" "${KIND_VERSION#v}" | sort -V | head -n1)" == "1.35.0" ]]
+# Runs a step and logs how long it took, so CI logs show where e2e time goes.
+# The fields follow the make-timing lines from hack/make-timed-shell.sh:
+#   e2e-timing: started=2026-10-24T05:47:19Z finished=2026-10-24T05:48:01Z status=0 duration=42s step=kind/install_jobset
+# Callers must run with errexit on and invoke it as a plain command, not inside
+# "if", "&&" or "||": bash disables errexit for the whole function there, so a
+# failing step would keep running and be logged as status=0.
+# A failing step exits the script before its timing line; an EXIT trap that calls
+# e2e_timed_log_unfinished logs it instead. The trap only sees steps run in its
+# own shell, not in a background job or a subshell.
+# $1 label (prefix with the cluster or kubeconfig file name when several clusters run the step)
+# $2... command and its arguments
+function e2e_timed {
+    local label=$1
+    shift
+    local start=$SECONDS
+    local started_at
+    started_at=$(e2e_timestamp)
+    E2E_TIMED_STEP=$label
+    E2E_TIMED_START=$start
+    E2E_TIMED_STARTED_AT=$started_at
+    "$@"
+    E2E_TIMED_STEP=""
+    echo "e2e-timing: started=${started_at} finished=$(e2e_timestamp) status=0 duration=$((SECONDS - start))s step=${label}"
+}
+
+# Logs the e2e_timed step that was still running when the script exited, with
+# the script's exit status. Call it first in the EXIT trap, before cleanup adds
+# to the duration.
+# $1 exit status of the script
+function e2e_timed_log_unfinished {
+    if [[ -n ${E2E_TIMED_STEP:-} ]]; then
+        echo "e2e-timing: started=${E2E_TIMED_STARTED_AT} finished=$(e2e_timestamp) status=$1 duration=$((SECONDS - E2E_TIMED_START))s step=${E2E_TIMED_STEP}"
+    fi
+}
+
+# Prints the current UTC time in the format hack/make-timed-shell.sh uses.
+function e2e_timestamp {
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+# Returns success when a failed `docker pull` is worth another attempt.
+#
+# $1 file holding the failed attempt's combined output
+# $2 image reference
+function e2e_image_pull_is_retriable {
+    local output_file="$1"
+    local image="$2"
+
+    if grep -qiE "${E2E_NON_RETRIABLE_IMAGE_ERRORS}" "${output_file}"; then
+        return 1
+    fi
+
+    # quay.io answers both a degraded token service and a missing tag with a
+    # bare `unauthorized`; only a manifest lookup tells the two apart.
+    if grep -qiE 'unauthorized' "${output_file}"; then
+        local manifest_error
+        if manifest_error=$(docker manifest inspect "${image}" 2>&1 >/dev/null); then
+            return 0
+        fi
+        if grep -qiE "${E2E_MISSING_IMAGE_ERRORS}" <<<"${manifest_error}"; then
+            echo "Image '${image}' does not exist in the registry: ${manifest_error}" >&2
+            return 1
+        fi
+    fi
+
+    return 0
 }
 
 # $1 image reference
@@ -95,9 +172,11 @@ function e2e_docker_pull_if_needed {
         return 0
     fi
 
-    "${ROOT_DIR}/hack/testing/retry.sh" \
-        --attempts 7 --delay 2 --exponential --stream \
-        --continue-if "! grep -qiE '${E2E_NON_RETRIABLE_IMAGE_ERRORS}' {output}" \
+    export -f e2e_image_pull_is_retriable
+    # shellcheck disable=SC2016 # E2E_PULL_IMAGE is expanded by retry.sh's continue-if eval
+    E2E_PULL_IMAGE="${image}" "${ROOT_DIR}/hack/testing/retry.sh" \
+        --stream \
+        --continue-if 'e2e_image_pull_is_retriable "{output}" "${E2E_PULL_IMAGE}"' \
         -- docker pull "$image"
 }
 
@@ -107,7 +186,7 @@ function e2e_docker_manifest_available {
 
     # shellcheck disable=SC2016 # the $1 expansion is evaluated by the inner bash -c
     "${ROOT_DIR}/hack/testing/retry.sh" \
-        --attempts 7 --delay 2 --exponential --stream \
+        --stream \
         --continue-if "! grep -qiE '${E2E_NON_RETRIABLE_IMAGE_ERRORS}' {output}" \
         -- bash -c 'docker manifest inspect "$1" 2>&1 >/dev/null' _ "$image"
 }
@@ -117,8 +196,7 @@ function e2e_download_url {
 
     # Make HTTP errors retryable instead of passing their response bodies to
     # kubectl as manifests.
-    "${ROOT_DIR}/hack/testing/retry.sh" \
-        --attempts 7 --delay 2 --exponential -- \
+    "${ROOT_DIR}/hack/testing/retry.sh" -- \
         curl -fsSL "${url}"
 }
 
@@ -200,7 +278,7 @@ function e2e_wait_for_deployment_webhook_endpoints {
 
     export -f e2e_check_deployment_webhook_endpoints_once
     # shellcheck disable=SC2016 # the $@ expansion is evaluated by the inner bash -c
-    "${ROOT_DIR}/hack/testing/retry.sh" --attempts 150 --delay 2 --stream -- \
+    "${ROOT_DIR}/hack/testing/retry.sh" --attempts 150 --delay 2 --no-exponential --stream -- \
         bash -c 'e2e_check_deployment_webhook_endpoints_once "$@"' _ \
         "${kubeconfig}" "${ns}" "${deployment_name}" "${service_name}"
 }
@@ -253,7 +331,7 @@ if [[ -n ${APPWRAPPER_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(appwrapper|manag
     export APPWRAPPER_IMAGE=quay.io/ibm/appwrapper:${APPWRAPPER_VERSION}
 fi
 
-if [[ -n ${JOBSET_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(jobset|tas|trainjob|managejobswithoutqueuename) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
+if [[ -n ${JOBSET_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(jobset|tas|trainjob|managejobswithoutqueuename|was-deepintegration) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
     export JOBSET_MANIFEST="https://github.com/kubernetes-sigs/jobset/releases/download/${JOBSET_VERSION}/manifests.yaml"
     export JOBSET_IMAGE=registry.k8s.io/jobset/jobset:${JOBSET_VERSION}
     export JOBSET_CRDS=${ROOT_DIR}/dep-crds/jobset-operator/
@@ -295,7 +373,7 @@ if [[ -n ${KUBERAY_VERSION:-} && ("$GINKGO_ARGS" =~ feature:kuberay || ! "$GINKG
     export E2E_TEST_REDIS_IMAGE=${E2E_TEST_REDIS_IMAGE_WITH_SHA%%@*}
 fi
 
-if [[ -n ${LEADERWORKERSET_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(leaderworkerset|managejobswithoutqueuename|workloadidentifierannotations) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
+if [[ -n ${LEADERWORKERSET_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(leaderworkerset|managejobswithoutqueuename|workloadidentifierannotations|was-deepintegration) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
     export LEADERWORKERSET_MANIFEST="https://github.com/kubernetes-sigs/lws/releases/download/${LEADERWORKERSET_VERSION}/manifests.yaml"
     export LEADERWORKERSET_IMAGE=registry.k8s.io/lws/lws:${LEADERWORKERSET_VERSION}
 fi
@@ -304,31 +382,32 @@ if [[ -n ${SPARKOPERATOR_VERSION:-} && ("$GINKGO_ARGS" =~ feature:spark || ! "$G
     export SPARKOPERATOR_IMAGE="ghcr.io/kubeflow/spark-operator/controller:${SPARKOPERATOR_VERSION#v}"
 fi
 
+if [[ "${GINKGO_ARGS:-}" =~ feature:provisioning || ! "${GINKGO_ARGS:-}" =~ "--label-filter" ]]; then
+    export PROVISIONING_REQUEST_CRDS=${ROOT_DIR}/dep-crds/cluster-autoscaler/
+fi
+
 if [[ -n "${CERTMANAGER_VERSION:-}" ]]; then
     export CERTMANAGER_MANIFEST="https://github.com/cert-manager/cert-manager/releases/download/${CERTMANAGER_VERSION}/cert-manager.yaml"
 fi
 
 if [[ -n "${CLUSTERPROFILE_VERSION:-}" ]]; then
     export CLUSTERPROFILE_CRD=${ROOT_DIR}/dep-crds/clusterprofile/multicluster.x-k8s.io_clusterprofiles.yaml
-    # Only one secretreader image is ever needed per suite. From k8s 1.35 image volumes are
-    # enabled by default, so the official image can be mounted directly; on older versions we
-    # use the self-built image whose binary an init container copies into a shared volume,
-    # because the official image does not ship a "cp" command.
-    if e2e_supports_image_volume; then
-        export CLUSTERPROFILE_PLUGIN_IMAGE=registry.k8s.io/cluster-inventory-api/secretreader:${CLUSTERPROFILE_VERSION}
-    else
-        export CLUSTERPROFILE_PLUGIN_IMAGE=us-central1-docker.pkg.dev/k8s-staging-images/kueue/secretreader-plugin:${CLUSTERPROFILE_PLUGIN_IMAGE_VERSION}
-    fi
+    # Image volumes are enabled by default on all tested k8s versions (Beta from 1.35), so the
+    # official secretreader image is mounted directly into the Kueue manager pod.
+    export CLUSTERPROFILE_PLUGIN_IMAGE=registry.k8s.io/cluster-inventory-api/secretreader:${CLUSTERPROFILE_VERSION}
 fi
 
 if [[ -n "${PROMETHEUS_OPERATOR_VERSION:-}" ]]; then
     export PROMETHEUS_OPERATOR_BUNDLE="https://github.com/prometheus-operator/prometheus-operator/releases/download/${PROMETHEUS_OPERATOR_VERSION}/bundle.yaml"
     export PROMETHEUS_OPERATOR_IMAGE="quay.io/prometheus-operator/prometheus-operator:${PROMETHEUS_OPERATOR_VERSION}"
     export PROMETHEUS_CONFIG_RELOADER_IMAGE="quay.io/prometheus-operator/prometheus-config-reloader:${PROMETHEUS_OPERATOR_VERSION}"
+    PROMETHEUS_IMAGE_WITH_SHA=$(grep '^FROM' "${SOURCE_DIR}/prometheus/Dockerfile" | awk '{print $2}')
+    export PROMETHEUS_IMAGE=${PROMETHEUS_IMAGE_WITH_SHA%%@*}
 fi
 
 if [[ -n "${DRA_EXAMPLE_DRIVER_VERSION:-}" ]]; then
-    export DRA_EXAMPLE_DRIVER_REPO=https://github.com/kubernetes-sigs/dra-example-driver.git
+    export DRA_EXAMPLE_DRIVER_IMAGE=registry.k8s.io/dra-example-driver/dra-example-driver:${DRA_EXAMPLE_DRIVER_VERSION}
+    export DRA_EXAMPLE_DRIVER_HELM_CHART=oci://registry.k8s.io/dra-example-driver/charts/dra-example-driver
 fi
 
 # agnhost image to use for testing.
@@ -622,7 +701,6 @@ function cluster_create {
     if ! "${ROOT_DIR}/hack/testing/retry.sh" \
         --attempts 3 \
         --delay 3 \
-        --exponential \
         --continue-if "$continue_if" \
         --cleanup "$cleanup_cmd" \
         -- bash -c "$create_cmd"; then
@@ -661,7 +739,7 @@ function prepare_docker_images {
     if [[ -n ${APPWRAPPER_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(appwrapper|managejobswithoutqueuename) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
         e2e_docker_pull_if_needed "${APPWRAPPER_IMAGE}"
     fi
-    if [[ -n ${JOBSET_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(jobset|tas|trainjob|managejobswithoutqueuename) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
+    if [[ -n ${JOBSET_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(jobset|tas|trainjob|managejobswithoutqueuename|was-deepintegration) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
         e2e_docker_pull_if_needed "${JOBSET_IMAGE}"
     fi
     if [[ -n ${KUBEFLOW_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(jaxjob|pytorchjob) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
@@ -688,7 +766,7 @@ function prepare_docker_images {
             E2E_KIND_VERSION='' make -C "${ROOT_DIR}" kind-ray-project-mini-image-build
         fi
     fi
-    if [[ -n ${LEADERWORKERSET_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(leaderworkerset|managejobswithoutqueuename|workloadidentifierannotations) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
+    if [[ -n ${LEADERWORKERSET_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(leaderworkerset|managejobswithoutqueuename|workloadidentifierannotations|was-deepintegration) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
         e2e_docker_pull_if_needed "${LEADERWORKERSET_IMAGE}"
     fi
     if [[ -n ${SPARKOPERATOR_VERSION:-} && ("$GINKGO_ARGS" =~ feature:spark || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
@@ -698,9 +776,13 @@ function prepare_docker_images {
     if [[ -n ${PROMETHEUS_OPERATOR_VERSION:-} && ("$GINKGO_ARGS" =~ feature:prometheus || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
         e2e_docker_pull_if_needed "${PROMETHEUS_OPERATOR_IMAGE}"
         e2e_docker_pull_if_needed "${PROMETHEUS_CONFIG_RELOADER_IMAGE}"
+        e2e_docker_pull_if_needed "${PROMETHEUS_IMAGE}"
     fi
     if [[ -n ${CLUSTERPROFILE_VERSION:-} ]]; then
         e2e_docker_pull_if_needed "${CLUSTERPROFILE_PLUGIN_IMAGE}"
+    fi
+    if [[ -n ${DRA_EXAMPLE_DRIVER_VERSION:-} ]]; then
+        e2e_docker_pull_if_needed "${DRA_EXAMPLE_DRIVER_IMAGE}"
     fi
 }
 
@@ -728,48 +810,51 @@ function kind_load {
     local e2e_cluster_name=$1
     local e2e_kubeconfig=$2
 
-    cluster_kind_load "${e2e_cluster_name}"
+    e2e_timed "${e2e_cluster_name}/load_images" cluster_kind_load "${e2e_cluster_name}"
 
     if [[ -n ${APPWRAPPER_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(appwrapper|managejobswithoutqueuename) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
-        install_appwrapper "${e2e_cluster_name}" "${e2e_kubeconfig}"
+        e2e_timed "${e2e_cluster_name}/install_appwrapper" install_appwrapper "${e2e_cluster_name}" "${e2e_kubeconfig}"
     fi
-    if [[ -n ${JOBSET_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(jobset|tas|trainjob|managejobswithoutqueuename) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
-        install_jobset "${e2e_cluster_name}" "${e2e_kubeconfig}"
+    if [[ -n ${JOBSET_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(jobset|tas|trainjob|managejobswithoutqueuename|was-deepintegration) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
+        e2e_timed "${e2e_cluster_name}/install_jobset" install_jobset "${e2e_cluster_name}" "${e2e_kubeconfig}"
     fi
     if [[ -n ${KUBEFLOW_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(jaxjob|pytorchjob) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
         # In order for MPI-operator and Training-operator to work on the same cluster it is required that:
         # 1. 'kubeflow.org_mpijobs.yaml' is removed from base/crds/kustomization.yaml - https://github.com/kubeflow/training-operator/issues/1930
         # 2. Training-operator deployment is modified to enable all kubeflow jobs except for mpi -  https://github.com/kubeflow/training-operator/issues/1777
-        install_kubeflow "${e2e_cluster_name}" "${e2e_kubeconfig}"
+        e2e_timed "${e2e_cluster_name}/install_kubeflow" install_kubeflow "${e2e_cluster_name}" "${e2e_kubeconfig}"
     fi
 
     if [[ -n ${KUBEFLOW_TRAINER_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(tas|trainjob) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
-        install_kubeflow_trainer "${e2e_cluster_name}" "${e2e_kubeconfig}"
+        e2e_timed "${e2e_cluster_name}/install_kubeflow_trainer" install_kubeflow_trainer "${e2e_cluster_name}" "${e2e_kubeconfig}"
     fi
 
     if [[ -n ${KUBEFLOW_MPI_VERSION:-} && ("$GINKGO_ARGS" =~ feature:mpijob || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
-        install_mpi "${e2e_cluster_name}" "${e2e_kubeconfig}"
+        e2e_timed "${e2e_cluster_name}/install_mpi" install_mpi "${e2e_cluster_name}" "${e2e_kubeconfig}"
     fi
-    if [[ -n ${LEADERWORKERSET_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(leaderworkerset|managejobswithoutqueuename|workloadidentifierannotations) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
-        install_lws "${e2e_cluster_name}" "${e2e_kubeconfig}"
+    if [[ -n ${LEADERWORKERSET_VERSION:-} && ("$GINKGO_ARGS" =~ feature:(leaderworkerset|managejobswithoutqueuename|workloadidentifierannotations|was-deepintegration) || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
+        e2e_timed "${e2e_cluster_name}/install_lws" install_lws "${e2e_cluster_name}" "${e2e_kubeconfig}"
     fi
     if [[ -n ${KUBERAY_VERSION:-} && ("$GINKGO_ARGS" =~ feature:kuberay || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
-        install_kuberay "${e2e_cluster_name}" "${e2e_kubeconfig}"
+        e2e_timed "${e2e_cluster_name}/install_kuberay" install_kuberay "${e2e_cluster_name}" "${e2e_kubeconfig}"
     fi
     if [[ -n ${SPARKOPERATOR_VERSION:-} && ("$GINKGO_ARGS" =~ feature:spark || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
-        install_sparkoperator "$1" "$2"
+        e2e_timed "${e2e_cluster_name}/install_sparkoperator" install_sparkoperator "$1" "$2"
     fi
     if [[ -n ${CERTMANAGER_VERSION:-} ]]; then
-        install_cert_manager "${e2e_kubeconfig}"
+        e2e_timed "${e2e_cluster_name}/install_cert_manager" install_cert_manager "${e2e_kubeconfig}"
     fi
     if [[ -n ${PROMETHEUS_OPERATOR_VERSION:-} && ("$GINKGO_ARGS" =~ feature:prometheus || ! "$GINKGO_ARGS" =~ "--label-filter") ]]; then
-        install_prometheus_operator "${e2e_cluster_name}" "${e2e_kubeconfig}"
+        e2e_timed "${e2e_cluster_name}/install_prometheus_operator" install_prometheus_operator "${e2e_cluster_name}" "${e2e_kubeconfig}"
     fi
     if [[ -n ${CLUSTERPROFILE_VERSION:-} ]]; then
-        install_multicluster "${e2e_kubeconfig}"
+        e2e_timed "${e2e_cluster_name}/install_multicluster" install_multicluster "${e2e_kubeconfig}"
     fi
     if [[ -n ${DRA_EXAMPLE_DRIVER_VERSION:-} ]]; then
-        install_dra_example_driver "${e2e_cluster_name}" "${e2e_kubeconfig}"
+        e2e_timed "${e2e_cluster_name}/install_dra_example_driver" install_dra_example_driver "${e2e_cluster_name}" "${e2e_kubeconfig}"
+    fi
+    if [[ -n ${PROVISIONING_REQUEST_CRDS:-} && ("${GINKGO_ARGS:-}" =~ feature:provisioning || ! "${GINKGO_ARGS:-}" =~ "--label-filter") ]]; then
+        e2e_timed "${e2e_cluster_name}/install_provisioning_request_crds" install_provisioning_request_crds "${e2e_kubeconfig}"
     fi
 }
 
@@ -904,7 +989,7 @@ kind: ResourceFlavor
 metadata:
   name: webhook-probe
 EOF
-    "${ROOT_DIR}/hack/testing/retry.sh" --attempts 7 --delay 2 --exponential --stream -- \
+    "${ROOT_DIR}/hack/testing/retry.sh" --stream -- \
         kubectl ${kubectl_args[@]+"${kubectl_args[@]}"} create --dry-run=server -f "${probe_manifest}"
 }
 
@@ -924,7 +1009,7 @@ function cluster_kueue_deploy {
             -l app.kubernetes.io/instance=cert-manager \
             --timeout=5m
         if [ "$E2E_USE_HELM" == 'true' ]; then
-            helm_install "$1" "${ROOT_DIR}/test/e2e/config/certmanager/values.yaml"
+            helm_install "$1" "${ROOT_DIR}/test/e2e/config/certmanager/values.yaml" "${ROOT_DIR}/test/e2e/config/certmanager"
         else
             deploy_with_certmanager "$1"
         fi
@@ -937,19 +1022,49 @@ function cluster_kueue_deploy {
             build_and_apply_kueue_manifests "$1" "${ROOT_DIR}/test/e2e/config/dra/whole-device"
         fi
     elif [ "$E2E_USE_HELM" == 'true' ]; then
-        helm_install "$1" "${ROOT_DIR}/test/e2e/config/default/values.yaml"
+        helm_install "$1" "${ROOT_DIR}/test/e2e/config/default/values.yaml" "${ROOT_DIR}/test/e2e/config/${E2E_CONFIG_FOLDER:-default}"
     else
         build_and_apply_kueue_manifests "$1" "${ROOT_DIR}/test/e2e/config/${E2E_CONFIG_FOLDER:-default}"
     fi
 
-    wait_for_kueue_controller_operator "$1"
+    if e2e_is_truthy "${E2E_NETWORK_POLICIES:-}" && [ "$E2E_USE_HELM" != 'true' ]; then
+        build_and_apply_kueue_manifests "$1" "${ROOT_DIR}/config/networkpolicy"
+    fi
+
+    e2e_timed "${1:+$(basename "$1")/}kueue_wait_ready" wait_for_kueue_controller_operator "$1"
 }
 
 # $1 kubeconfig
 # $2 values file
+# $3 kustomization config whose kueue-manager-config and controller-manager
+#    replicas are used, and whose alpha CRDs decide enableAlphaAPIs,
+#    so that Helm and kustomize installs share them
 function helm_install {
+    local manifests manager_config replicas alpha_apis=false
+    manifests=$($KUSTOMIZE build "$3")
+    manager_config=$(mktemp)
+    # shellcheck disable=SC2064 # Intentionally expand now to capture the temp file path
+    trap "rm -f '$manager_config'" RETURN
+    $YQ -e 'select(.kind == "ConfigMap" and .metadata.name == "kueue-manager-config") | .data."controller_manager_config.yaml"' \
+        <<<"$manifests" >"$manager_config"
+    replicas=$($YQ -e 'select(.kind == "Deployment" and .metadata.name == "kueue-controller-manager") | .spec.replicas' <<<"$manifests")
+    # The chart's enableAlphaAPIs installs all CRDs of config/components/crd/alpha,
+    # so turn it on if the build contains any of them.
+    if $YQ -N 'select(.kind == "CustomResourceDefinition") | .metadata.name' <<<"$manifests" |
+        grep -Fx -f <($KUSTOMIZE build "${ROOT_DIR}/config/components/crd/alpha" | $YQ -N '.metadata.name') >/dev/null; then
+        alpha_apis=true
+    fi
+    local network_policies=false
+    if e2e_is_truthy "${E2E_NETWORK_POLICIES:-}"; then
+        network_policies=true
+    fi
+
     $HELM install \
       -f "$2" \
+      --set-file "managerConfig.controllerManagerConfigYaml=${manager_config}" \
+      --set "controllerManager.replicas=${replicas}" \
+      --set "enableAlphaAPIs=${alpha_apis}" \
+      --set "networkPolicy.enabled=${network_policies}" \
       --set "controllerManager.manager.image.repository=${IMAGE_TAG%:*}" \
       --set "controllerManager.manager.image.tag=${IMAGE_TAG##*:}" \
       --create-namespace \
@@ -1018,6 +1133,25 @@ function install_appwrapper {
     cluster_kind_load_image "${name}" "${APPWRAPPER_IMAGE}"
     kubectl apply --kubeconfig="${kubeconfig}" --server-side -k "${APPWRAPPER_MANIFEST}"
     e2e_wait_for_operator_in_install "${kubeconfig}" "${ns}" "${deployment_name}"
+}
+
+# $1 kubeconfig option
+function install_provisioning_request_crds {
+    local kubeconfig=${1:-}
+    local -a kubectl_args=()
+    if [[ -n "${kubeconfig}" ]]; then
+        kubectl_args+=(--kubeconfig="${kubeconfig}")
+    fi
+
+    if e2e_crd_exists "${kubeconfig}" "provisioningrequests.autoscaling.x-k8s.io"; then
+        if [[ "${E2E_MODE}" == "dev" ]] && ! e2e_is_truthy "${E2E_ENFORCE_OPERATOR_UPDATE}"; then
+            echo "ProvisioningRequest CRD already installed; skipping install (E2E_MODE=dev)."
+            return 0
+        fi
+    fi
+
+    echo "Installing ProvisioningRequest CRDs from ${PROVISIONING_REQUEST_CRDS}"
+    kubectl ${kubectl_args[@]+"${kubectl_args[@]}"} apply --server-side -f "${PROVISIONING_REQUEST_CRDS}"
 }
 
 # $1 cluster name
@@ -1322,7 +1456,7 @@ function install_sparkoperator {
         --set image.tag="${expected_version}"
         --set 'spark.jobNamespaces[0]='
     )
-    "${ROOT_DIR}/hack/testing/retry.sh" --attempts 7 --delay 2 --exponential --stream -- \
+    "${ROOT_DIR}/hack/testing/retry.sh" --stream -- \
         "${HELM}" "${install_args[@]}"
 }
 
@@ -1397,11 +1531,17 @@ function install_prometheus_operator {
 
     cluster_kind_load_image "${name}" "${PROMETHEUS_OPERATOR_IMAGE}"
     cluster_kind_load_image "${name}" "${PROMETHEUS_CONFIG_RELOADER_IMAGE}"
+    cluster_kind_load_image "${name}" "${PROMETHEUS_IMAGE}"
     e2e_kubectl_apply_url "${PROMETHEUS_OPERATOR_BUNDLE}" --kubeconfig="${kubeconfig}"
     kubectl wait deploy/"${deployment_name}" -n "${ns}" \
         --for=condition=available --timeout=5m --kubeconfig="${kubeconfig}"
-    kubectl apply --kubeconfig="${kubeconfig}" --server-side \
-        -f "${ROOT_DIR}/test/e2e/config/prometheus/prometheus-setup.yaml"
+    (
+        prometheus_setup=$(mktemp) && trap 'rm -f "$prometheus_setup"' EXIT
+        cp "${ROOT_DIR}/test/e2e/config/prometheus/prometheus-setup.yaml" "$prometheus_setup"
+        $YQ -i "(select(.kind == \"Prometheus\") | .spec.image) = \"${PROMETHEUS_IMAGE}\"" "$prometheus_setup"
+        $YQ -i "(select(.kind == \"Prometheus\") | .spec.version) = \"${PROMETHEUS_IMAGE##*:}\"" "$prometheus_setup"
+        kubectl apply --kubeconfig="${kubeconfig}" --server-side -f "$prometheus_setup"
+    )
 }
 
 # $1 kubeconfig option
@@ -1453,33 +1593,14 @@ function install_dra_example_driver {
         fi
     fi
 
-    local dra_driver_temp_dir
-    dra_driver_temp_dir=$(mktemp -d)
+    local dra_chart_dir
+    dra_chart_dir=$(mktemp -d)
     # shellcheck disable=SC2064 # Intentionally expand now to capture the temp dir path
-    trap "rm -rf '$dra_driver_temp_dir'" RETURN
-    git clone --depth 1 --branch "${DRA_EXAMPLE_DRIVER_VERSION}" "${DRA_EXAMPLE_DRIVER_REPO}" "$dra_driver_temp_dir"
+    trap "rm -rf '$dra_chart_dir'" RETURN
+    "${ROOT_DIR}/hack/testing/retry.sh" --stream \
+        -- "$HELM" pull "${DRA_EXAMPLE_DRIVER_HELM_CHART}" --version "${expected_version#v}" --untar --untardir "$dra_chart_dir"
 
-    local dra_image_repo="dra-example-driver"
-    local dra_image_tag="${expected_version#v}"
-    dra_image_tag="${dra_image_tag//\//-}"
-    if [[ -z "${dra_image_tag}" ]]; then
-        dra_image_tag="local"
-    fi
-
-    local go_version
-    go_version=$(grep '^go ' "$dra_driver_temp_dir/go.mod" | awk '{print $2}' | cut -d. -f1,2)
-
-    echo "Building dra-example-driver image from source (Go ${go_version})..."
-    # Patch Makefile to ensure static build with CGO_ENABLED=0
-    sed 's/CGO_LDFLAGS_ALLOW/CGO_ENABLED=0 CGO_LDFLAGS_ALLOW/' "$dra_driver_temp_dir/Makefile" > "$dra_driver_temp_dir/Makefile.tmp" \
-        && mv "$dra_driver_temp_dir/Makefile.tmp" "$dra_driver_temp_dir/Makefile"
-    docker build -t "${dra_image_repo}:${dra_image_tag}" \
-        --build-arg GO_VERSION="${go_version}" \
-        --build-arg BASE_IMAGE=gcr.io/distroless/static:latest \
-        -f "$dra_driver_temp_dir/deployments/container/Dockerfile" \
-        "$dra_driver_temp_dir"
-
-    cluster_kind_load_image "${name}" "${dra_image_repo}:${dra_image_tag}"
+    cluster_kind_load_image "${name}" "${DRA_EXAMPLE_DRIVER_IMAGE}"
 
     local -a extra_helm_args=()
     if [[ -n ${DRA_GPU_PARTITIONS:-} ]]; then
@@ -1493,13 +1614,11 @@ function install_dra_example_driver {
       --create-namespace \
       --namespace dra-example-driver \
       --kubeconfig="${kubeconfig}" \
-      --set image.repository="${dra_image_repo}" \
-      --set image.tag="${dra_image_tag}" \
       --set kubeletPlugin.containers.plugin.securityContext.privileged=true \
       "${extra_helm_args[@]}" \
       --wait \
       dra-example-driver \
-      "$dra_driver_temp_dir/deployments/helm/dra-example-driver"
+      "$dra_chart_dir/dra-example-driver"
 }
 
 

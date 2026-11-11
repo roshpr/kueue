@@ -232,9 +232,7 @@ func TestValidateClusterQueue(t *testing.T) {
 		{
 			name: "resources in a flavor in different order",
 			clusterQueue: &kueue.ClusterQueue{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "cluster-queue",
-				},
+				Name: "cluster-queue",
 				Spec: kueue.ClusterQueueSpec{
 					ResourceGroups: []kueue.ResourceGroup{
 						{
@@ -295,9 +293,7 @@ func TestValidateClusterQueue(t *testing.T) {
 		{
 			name: "valid preemption with borrowWithinCohort",
 			clusterQueue: &kueue.ClusterQueue{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "cluster-queue",
-				},
+				Name: "cluster-queue",
 				Spec: kueue.ClusterQueueSpec{
 					Preemption: &kueue.ClusterQueuePreemption{
 						ReclaimWithinCohort: kueue.PreemptionPolicyLowerPriority,
@@ -312,9 +308,7 @@ func TestValidateClusterQueue(t *testing.T) {
 		{
 			name: "existing cluster queue created with older Kueue version that has a nil borrowWithinCohort field",
 			clusterQueue: &kueue.ClusterQueue{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "cluster-queue",
-				},
+				Name: "cluster-queue",
 				Spec: kueue.ClusterQueueSpec{
 					Preemption: &kueue.ClusterQueuePreemption{
 						ReclaimWithinCohort: kueue.PreemptionPolicyNever,
@@ -416,20 +410,20 @@ func TestValidateClusterQueue(t *testing.T) {
 			wantBadValue: "2",
 		},
 		{
-			name: "ConcurrentAdmissionPolicy with more than 16 flavors",
+			name: "ConcurrentAdmissionPolicy with more than 32 flavors",
 			clusterQueue: utiltestingapi.MakeClusterQueue("cluster-queue").
 				ConcurrentAdmissionPolicy(kueue.ConcurrentAdmissionTryPreferredFlavors).
-				ResourceGroup(makeFlavors(17)...).
+				ResourceGroup(makeFlavors(33)...).
 				Obj(),
 			wantErr: field.ErrorList{
 				field.Invalid(
 					specPath.Child("resourceGroups").Index(0).Child("flavors"),
-					17,
-					"cannot have more than 16 resource flavors in the ResourceGroup when ConcurrentAdmissionPolicy is defined",
+					33,
+					"cannot have more than 32 resource flavors in the ResourceGroup when ConcurrentAdmissionPolicy is defined",
 				),
 			},
-			wantDetail:   "cannot have more than 16 resource flavors in the ResourceGroup when ConcurrentAdmissionPolicy is defined",
-			wantBadValue: "17",
+			wantDetail:   "cannot have more than 32 resource flavors in the ResourceGroup when ConcurrentAdmissionPolicy is defined",
+			wantBadValue: "33",
 		},
 		{
 			name: "ConcurrentAdmissionPolicy with empty ResourceGroups",
@@ -468,6 +462,46 @@ func TestValidateClusterQueue(t *testing.T) {
 				ConcurrentAdmissionPolicy("").
 				LastAcceptableFlavorName("flavor1").
 				Obj(),
+		},
+		{
+			name: "ConcurrentAdmissionPolicy constraints with nil migration mode is allowed",
+			clusterQueue: func() *kueue.ClusterQueue {
+				cq := utiltestingapi.MakeClusterQueue("cluster-queue").
+					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("flavor1").Resource("cpu", "1").Obj()).
+					Obj()
+				cq.Spec.ConcurrentAdmissionPolicy = &kueue.ConcurrentAdmissionPolicy{
+					Migration: kueue.ConcurrentAdmissionMigration{
+						Constraints: &kueue.ConcurrentAdmissionConstraints{
+							LastAcceptableFlavorName: new(kueue.ResourceFlavorReference("flavor1")),
+						},
+					},
+				}
+				return cq
+			}(),
+		},
+		{
+			name: "ConcurrentAdmissionPolicy constraints with nil migration mode and invalid LastAcceptableFlavorName",
+			clusterQueue: func() *kueue.ClusterQueue {
+				cq := utiltestingapi.MakeClusterQueue("cluster-queue").
+					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("flavor1").Resource("cpu", "1").Obj()).
+					Obj()
+				cq.Spec.ConcurrentAdmissionPolicy = &kueue.ConcurrentAdmissionPolicy{
+					Migration: kueue.ConcurrentAdmissionMigration{
+						Constraints: &kueue.ConcurrentAdmissionConstraints{
+							LastAcceptableFlavorName: new(kueue.ResourceFlavorReference("non-existent-flavor")),
+						},
+					},
+				}
+				return cq
+			}(),
+			wantErr: field.ErrorList{
+				field.Invalid(
+					specPath.Child("concurrentAdmissionPolicy").Child("migration").Child("constraints").Child("lastAcceptableFlavorName"),
+					kueue.ResourceFlavorReference("non-existent-flavor"),
+					"must be one of the flavors defined in the ClusterQueue: [flavor1]"),
+			},
+			wantDetail:   "must be one of the flavors defined in the ClusterQueue: [flavor1]",
+			wantBadValue: "non-existent-flavor",
 		},
 		{
 			name: "ConcurrentAdmissionPolicy with invalid LastAcceptableFlavorName",
@@ -647,7 +681,7 @@ func TestValidateClusterQueueUpdate(t *testing.T) {
 				field.Invalid(field.NewPath("spec", "concurrentAdmissionPolicy"),
 					&kueue.ConcurrentAdmissionPolicy{
 						Migration: kueue.ConcurrentAdmissionMigration{
-							Mode: kueue.ConcurrentAdmissionTryPreferredFlavors}},
+							Mode: new(kueue.ConcurrentAdmissionTryPreferredFlavors)}},
 					"field is immutable"),
 			},
 			featureGates: map[featuregate.Feature]bool{features.ConcurrentAdmission: true},

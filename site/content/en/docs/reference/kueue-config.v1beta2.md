@@ -93,13 +93,6 @@ and passing the readiness probe) within the specified time. If the timeout
 is exceeded, then the workload is evicted.</p>
 </td>
 </tr>
-<tr><td><code>quotaReleaseStrategy</code><br/>
-<a href="#config-kueue-x-k8s-io-v1beta2-QuotaReleaseStrategy"><code>QuotaReleaseStrategy</code></a>
-</td>
-<td>
-   <p>QuotaReleaseStrategy provides configuration options for controlling quota release timing.</p>
-</td>
-</tr>
 <tr><td><code>clientConnection</code> <B>[Required]</B><br/>
 <a href="#config-kueue-x-k8s-io-v1beta2-ClientConnection"><code>ClientConnection</code></a>
 </td>
@@ -272,7 +265,7 @@ using the ClusterProfile API.</p>
 </td>
 </tr>
 <tr><td><code>credentialsProviders</code><br/>
-<a href="#config-kueue-x-k8s-io-v1beta2-ClusterProfileAccessProvider"><code>[]ClusterProfileAccessProvider</code></a>
+<a href="#config-kueue-x-k8s-io-v1beta2-ClusterProfileCredentialsProvider"><code>[]ClusterProfileCredentialsProvider</code></a>
 </td>
 <td>
    <p>CredentialsProviders defines a list of providers to obtain credentials of worker clusters
@@ -316,6 +309,19 @@ are mutually exclusive.</p>
 </tr>
 </tbody>
 </table>
+
+## `ClusterProfileCredentialsProvider`     {#config-kueue-x-k8s-io-v1beta2-ClusterProfileCredentialsProvider}
+    
+
+**Appears in:**
+
+- [ClusterProfile](#config-kueue-x-k8s-io-v1beta2-ClusterProfile)
+
+
+<p>ClusterProfileAccessProvider defines an access provider in the ClusterProfile API.</p>
+
+
+
 
 ## `ControllerConfigurationSpec`     {#config-kueue-x-k8s-io-v1beta2-ControllerConfigurationSpec}
     
@@ -490,6 +496,21 @@ registered within this manager.</p>
 <tbody>
     
   
+<tr><td><code>accessControlMode</code><br/>
+<a href="#config-kueue-x-k8s-io-v1beta2-MetricsAccessControlMode"><code>MetricsAccessControlMode</code></a>
+</td>
+<td>
+   <p>AccessControlMode selects how the metrics listener authenticates and authorizes requests.
+Requires the MetricsAccessControl feature gate.
+Possible values are:</p>
+<ul>
+<li>Delegated: each request needs a bearer token that passes TokenReview and SubjectAccessReview.</li>
+<li>None: no authentication or authorization. For enabled metrics, requires the
+loopback IP and port in bindAddress.
+Defaults to Delegated when the feature gate is enabled.</li>
+</ul>
+</td>
+</tr>
 <tr><td><code>bindAddress</code><br/>
 <code>string</code>
 </td>
@@ -996,7 +1017,10 @@ of creating a workload from a composable job (pod group), if multiple objects
 have labels with some key from the list, the values of these labels must
 match or otherwise the workload creation would fail. The labels are copied only
 during the workload creation and are not updated even if the labels of the
-underlying job are changed.</p>
+underlying job are changed.
+Kueue never copies its internal labels kueue.x-k8s.io/multikueue-origin,
+kueue.x-k8s.io/concurrent-admission-parent and kueue.x-k8s.io/job-uid from
+the job.</p>
 </td>
 </tr>
 </tbody>
@@ -1085,6 +1109,20 @@ If left empty, then metrics will expose for all local queues across namespaces.<
 </tr>
 </tbody>
 </table>
+
+## `MetricsAccessControlMode`     {#config-kueue-x-k8s-io-v1beta2-MetricsAccessControlMode}
+    
+(Alias of `string`)
+
+**Appears in:**
+
+- [ControllerMetrics](#config-kueue-x-k8s-io-v1beta2-ControllerMetrics)
+
+
+<p>MetricsAccessControlMode specifies how access to the metrics listener is controlled.</p>
+
+
+
 
 ## `MultiKueue`     {#config-kueue-x-k8s-io-v1beta2-MultiKueue}
     
@@ -1245,25 +1283,6 @@ A nil value disables automatic deletion of Workloads.</p>
 
 <p>QuotaCheckStrategy determines how Kueue checks resources against quota
 during admission.</p>
-
-
-
-
-## `QuotaReleaseStrategy`     {#config-kueue-x-k8s-io-v1beta2-QuotaReleaseStrategy}
-    
-(Alias of `string`)
-
-**Appears in:**
-
-- [Configuration](#config-kueue-x-k8s-io-v1beta2-Configuration)
-
-
-<p>QuotaReleaseStrategy defines when Kueue releases quota for a terminating workload.</p>
-<p>Valid values are:</p>
-<ul>
-<li>&quot;OnTerminating&quot; (default): releases quota as soon as all pods have a deletionTimestamp set.</li>
-<li>&quot;OnTerminal&quot;: holds quota until all underlying pods have fully reached a terminal phase (Succeeded or Failed).</li>
-</ul>
 
 
 
@@ -1620,6 +1639,35 @@ is awaited to be scheduled.
 After exceeding the timeout the corresponding job gets suspended again
 and requeued after the backoff delay.
 Defaults to the value of timeout. Setting to &quot;0s&quot; disables recovery timeout checking.</p>
+</td>
+</tr>
+<tr><td><code>unscheduledTimeout</code><br/>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#duration-v1-meta"><code>k8s.io/apimachinery/pkg/apis/meta/v1.Duration</code></a>
+</td>
+<td>
+   <p>UnscheduledTimeout defines a timeout, measured since the transition to the
+Admitted=True condition, for all the Pods required by the admission to be
+scheduled or to have succeeded. The deadline never exceeds timeout since
+admission. Exceeding it evicts the Workload with the PodsReadyTimeout reason
+and requeues it after the backoff delay.
+A current-admission PodsScheduled=False observation is required for eviction;
+a late observation does not restart the timeout.
+Must be non-negative and must not exceed timeout. When unset or &quot;0s&quot;, scheduling
+tracking, readiness propagation, scheduling timeouts and scheduling-history resets are disabled.
+Requires the WaitForPodsReadyUnscheduledTimeout feature gate, even for &quot;0s&quot;.
+Enabling this gate together with DisableWaitForPodsReady is rejected.</p>
+</td>
+</tr>
+<tr><td><code>maxTimeoutOnWorkload</code><br/>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#duration-v1-meta"><code>k8s.io/apimachinery/pkg/apis/meta/v1.Duration</code></a>
+</td>
+<td>
+   <p>MaxTimeoutOnWorkload defines the upper bound allowed for a per-workload
+PodsReady timeoutSeconds and recoveryTimeoutSeconds override (set via the <code>kueue.x-k8s.io/wait-for-pods-ready</code>
+annotation). If a workload requests a timeoutSeconds or recoveryTimeoutSeconds greater than
+MaxTimeoutOnWorkload, the job is rejected by the admission webhook.
+When unset, the default maximum of 2 hours is enforced.
+It has no effect on workloads that don't set a per-workload override.</p>
 </td>
 </tr>
 </tbody>

@@ -28,6 +28,8 @@ import (
 	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	"sigs.k8s.io/kueue/pkg/constants"
+	"sigs.k8s.io/kueue/pkg/controller/core/dqo"
+	"sigs.k8s.io/kueue/pkg/controller/core/localcapacity"
 	"sigs.k8s.io/kueue/pkg/dra"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/metrics"
@@ -51,12 +53,19 @@ type SetupControllersOpts struct {
 	DRABackedResources        *dra.ExtendedResourceCache
 	ResourceFormatter         *resources.ResourceFormatter
 	ResourceSliceAPIAvailable bool
+	ClusterProfileCRDPresent  bool
+	// ClusterQueueWatchers are notified of ClusterQueue changes after the
+	// built in watchers.
+	ClusterQueueWatchers []ClusterQueueUpdateWatcher
 }
 
 // SetupControllers sets up the core controllers. It returns the name of the
 // controller that failed to create and an error, if any.
 func SetupControllers(mgr ctrl.Manager, qManager *qcache.Manager, cc *schdcache.Cache, cfg *configapi.Configuration, opts SetupControllersOpts) (string, error) {
-	lqMetrics := metrics.NewLocalQueueMetricsConfig(cfg.Metrics.LocalQueueMetrics)
+	lqMetrics, err := metrics.NewLocalQueueMetricsConfig(cfg.Metrics.LocalQueueMetrics)
+	if err != nil {
+		return "LocalQueue", err
+	}
 	rfRec := NewResourceFlavorReconciler(mgr.GetClient(), qManager, cc, opts.RoleTracker)
 	if err := rfRec.SetupWithManager(mgr, cfg); err != nil {
 		return "ResourceFlavor", err
@@ -88,6 +97,7 @@ func SetupControllers(mgr ctrl.Manager, qManager *qcache.Manager, cc *schdcache.
 		return "Cohort", err
 	}
 	watchers = append(watchers, cohortRec)
+	watchers = append(watchers, opts.ClusterQueueWatchers...)
 
 	cqRec := NewClusterQueueReconciler(
 		mgr.GetClient(),
@@ -101,6 +111,7 @@ func SetupControllers(mgr ctrl.Manager, qManager *qcache.Manager, cc *schdcache.
 	)
 	rfRec.AddUpdateWatcher(cqRec)
 	acRec.AddUpdateWatchers(cqRec)
+	cohortRec.AddUpdateWatcher(cqRec)
 	if err := cqRec.SetupWithManager(mgr, cfg); err != nil {
 		return "ClusterQueue", err
 	}
@@ -135,9 +146,15 @@ func SetupControllers(mgr ctrl.Manager, qManager *qcache.Manager, cc *schdcache.
 	}
 
 	if features.Enabled(features.DynamicQuotaOrchestration) {
-		dqoRec := NewDynamicQuotaOrchestratorReconciler(mgr.GetClient(), WithDynamicQuotaOrchestratorRoleTracker(opts.RoleTracker))
+		dqoRec := dqo.NewReconciler(mgr.GetClient(), dqo.WithRoleTracker(opts.RoleTracker))
 		if err := dqoRec.SetupWithManager(mgr); err != nil {
 			return "DynamicQuotaOrchestrator", err
+		}
+		if features.Enabled(features.DQOLocalCapacityProvider) {
+			lcRec := localcapacity.NewReconciler(mgr.GetClient(), localcapacity.WithRoleTracker(opts.RoleTracker))
+			if err := lcRec.SetupWithManager(mgr); err != nil {
+				return "DQOLocalCapacityProvider", err
+			}
 		}
 	}
 
@@ -155,8 +172,9 @@ func waitForPodsReady(cfg *configapi.WaitForPodsReady) *waitForPodsReadyConfig {
 	result := waitForPodsReadyConfig{
 		timeout: cfg.Timeout.Duration,
 	}
-	if cfg.RecoveryTimeout != nil && cfg.RecoveryTimeout.Duration > 0 {
-		result.recoveryTimeout = &cfg.RecoveryTimeout.Duration
+	result.recoveryTimeout = waitforpodsready.RecoveryTimeout(cfg)
+	if waitforpodsready.PodsScheduledTrackingEnabled(cfg) {
+		result.unscheduledTimeout = &cfg.UnscheduledTimeout.Duration
 	}
 	if cfg.RequeuingStrategy != nil {
 		result.requeuingBackoffBaseSeconds = *cfg.RequeuingStrategy.BackoffBaseSeconds

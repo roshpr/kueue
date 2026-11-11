@@ -78,10 +78,6 @@ type Configuration struct {
 	// is exceeded, then the workload is evicted.
 	WaitForPodsReady *WaitForPodsReady `json:"waitForPodsReady,omitempty"`
 
-	// QuotaReleaseStrategy provides configuration options for controlling quota release timing.
-	// +optional
-	QuotaReleaseStrategy *QuotaReleaseStrategy `json:"quotaReleaseStrategy,omitempty"`
-
 	// ClientConnection provides additional configuration options for Kubernetes
 	// API server client.
 	ClientConnection *ClientConnection `json:"clientConnection,omitempty"`
@@ -175,8 +171,32 @@ type ControllerWebhook struct {
 	CertDir string `json:"certDir,omitempty"`
 }
 
+// MetricsAccessControlMode specifies how access to the metrics listener is controlled.
+// +enum
+type MetricsAccessControlMode string
+
+const (
+	// MetricsAccessControlModeDelegated delegates authentication and authorization
+	// to Kubernetes through controller-runtime.
+	MetricsAccessControlModeDelegated MetricsAccessControlMode = "Delegated"
+
+	// MetricsAccessControlModeNone disables authentication and authorization
+	// for the metrics listener.
+	MetricsAccessControlModeNone MetricsAccessControlMode = "None"
+)
+
 // ControllerMetrics defines the metrics configs.
 type ControllerMetrics struct {
+	// AccessControlMode selects how the metrics listener authenticates and authorizes requests.
+	// Requires the MetricsAccessControl feature gate.
+	// Possible values are:
+	// - Delegated: each request needs a bearer token that passes TokenReview and SubjectAccessReview.
+	// - None: no authentication or authorization. For enabled metrics, requires the
+	//   loopback IP and port in bindAddress.
+	// Defaults to Delegated when the feature gate is enabled.
+	// +optional
+	AccessControlMode *MetricsAccessControlMode `json:"accessControlMode,omitempty"`
+
 	// BindAddress is the TCP address that the controller should bind to
 	// for serving prometheus metrics.
 	// It can be set to "0" to disable the metrics serving.
@@ -303,27 +323,6 @@ type ControllerConfigurationSpec struct {
 	CacheSyncTimeout *time.Duration `json:"cacheSyncTimeout,omitempty"`
 }
 
-// QuotaReleaseStrategy defines when Kueue releases quota for a terminating workload.
-//
-// Valid values are:
-// - "OnTerminating" (default): releases quota as soon as all pods have a deletionTimestamp set.
-// - "OnTerminal": holds quota until all underlying pods have fully reached a terminal phase (Succeeded or Failed).
-//
-// +enum
-type QuotaReleaseStrategy string
-
-const (
-	// QuotaReleaseOnTerminating releases quota as soon as all pods have a
-	// deletionTimestamp set. This is the default and matches the existing
-	// behaviour of the batch/v1 Job integration.
-	QuotaReleaseOnTerminating QuotaReleaseStrategy = "OnTerminating"
-	// QuotaReleaseOnTerminal holds quota until all underlying pods
-	// have fully reached a terminal phase (Succeeded or Failed). This prevents
-	// scheduling failures for TopologyAwareScheduling (TAS) workloads where new
-	// pods cannot be placed until old pods physically release the hardware.
-	QuotaReleaseOnTerminal QuotaReleaseStrategy = "OnTerminal"
-)
-
 // WaitForPodsReady defines configuration for the Wait For Pods Ready feature,
 // which is used to ensure that all Pods are ready within the specified time.
 type WaitForPodsReady struct {
@@ -352,6 +351,29 @@ type WaitForPodsReady struct {
 	// Defaults to the value of timeout. Setting to "0s" disables recovery timeout checking.
 	// +optional
 	RecoveryTimeout *metav1.Duration `json:"recoveryTimeout,omitempty"`
+
+	// UnscheduledTimeout defines a timeout, measured since the transition to the
+	// Admitted=True condition, for all the Pods required by the admission to be
+	// scheduled or to have succeeded. The deadline never exceeds timeout since
+	// admission. Exceeding it evicts the Workload with the PodsReadyTimeout reason
+	// and requeues it after the backoff delay.
+	// A current-admission PodsScheduled=False observation is required for eviction;
+	// a late observation does not restart the timeout.
+	// Must be non-negative and must not exceed timeout. When unset or "0s", scheduling
+	// tracking, readiness propagation, scheduling timeouts and scheduling-history resets are disabled.
+	// Requires the WaitForPodsReadyUnscheduledTimeout feature gate, even for "0s".
+	// Enabling this gate together with DisableWaitForPodsReady is rejected.
+	// +optional
+	UnscheduledTimeout *metav1.Duration `json:"unscheduledTimeout,omitempty"`
+
+	// MaxTimeoutOnWorkload defines the upper bound allowed for a per-workload
+	// PodsReady timeoutSeconds and recoveryTimeoutSeconds override (set via the `kueue.x-k8s.io/wait-for-pods-ready`
+	// annotation). If a workload requests a timeoutSeconds or recoveryTimeoutSeconds greater than
+	// MaxTimeoutOnWorkload, the job is rejected by the admission webhook.
+	// When unset, the default maximum of 2 hours is enforced.
+	// It has no effect on workloads that don't set a per-workload override.
+	// +optional
+	MaxTimeoutOnWorkload *metav1.Duration `json:"maxTimeoutOnWorkload,omitempty"`
 }
 
 type MultiKueue struct {
@@ -594,6 +616,9 @@ type Integrations struct {
 	// match or otherwise the workload creation would fail. The labels are copied only
 	// during the workload creation and are not updated even if the labels of the
 	// underlying job are changed.
+	// Kueue never copies its internal labels kueue.x-k8s.io/multikueue-origin,
+	// kueue.x-k8s.io/concurrent-admission-parent and kueue.x-k8s.io/job-uid from
+	// the job.
 	LabelKeysToCopy []string `json:"labelKeysToCopy,omitempty"`
 }
 

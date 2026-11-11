@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	autoscaling "k8s.io/autoscaler/cluster-autoscaler/apis/provisioningrequest/autoscaling.x-k8s.io/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -54,9 +55,11 @@ type PodSetInfo struct {
 }
 
 // FromAssignment returns a PodSetInfo based on the provided assignment and an error if unable
-// to get any of the referenced flavors.
+// to get any of the referenced flavors. If assigned flavors disagree on a node label key, the
+// value from the first flavor in sorted resource order is kept.
 func FromAssignment(ctx context.Context, client client.Client, assignment *kueue.PodSetAssignment, podSet *kueue.PodSet) (PodSetInfo, error) {
 	processedFlvs := sets.New[kueue.ResourceFlavorReference]()
+	nodeLabelOwners := make(map[string]kueue.ResourceFlavorReference)
 	info := PodSetInfo{
 		Name:         assignment.Name,
 		NodeSelector: make(map[string]string),
@@ -64,6 +67,7 @@ func FromAssignment(ctx context.Context, client client.Client, assignment *kueue
 		Labels:       make(map[string]string),
 		Annotations:  make(map[string]string),
 	}
+	log := logr.FromContextOrDiscard(ctx)
 	if features.Enabled(features.TopologyAwareScheduling) && assignment.TopologyAssignment != nil {
 		// For implicit TAS we inject the "unconstrained" topology by default, even if unspecified.
 		if podSet.TopologyRequest == nil || (podSet.TopologyRequest.Preferred == nil &&
@@ -75,7 +79,8 @@ func FromAssignment(ctx context.Context, client client.Client, assignment *kueue
 			Name: kueue.TopologySchedulingGate,
 		})
 	}
-	for _, flvRef := range assignment.Flavors {
+	for _, resName := range slices.Sorted(maps.Keys(assignment.Flavors)) {
+		flvRef := assignment.Flavors[resName]
 		if processedFlvs.Has(flvRef) {
 			continue
 		}
@@ -84,7 +89,19 @@ func FromAssignment(ctx context.Context, client client.Client, assignment *kueue
 		if err := client.Get(ctx, types.NamespacedName{Name: string(flvRef)}, &flv); err != nil {
 			return info, err
 		}
-		utilmaps.Copy(&info.NodeSelector, flv.Spec.NodeLabels)
+		for key := range flv.Spec.NodeLabels {
+			if _, found := info.NodeSelector[key]; !found {
+				nodeLabelOwners[key] = flvRef
+			}
+		}
+		utilmaps.MergeKeepExisting(&info.NodeSelector, flv.Spec.NodeLabels, func(key string, kept, ignored string) {
+			log.V(3).Info("Ignoring conflicting flavor node label",
+				"key", key,
+				"keptFlavor", nodeLabelOwners[key],
+				"ignoredFlavor", flvRef,
+				"keptValue", kept,
+				"ignoredValue", ignored)
+		})
 		info.Tolerations = append(info.Tolerations, flv.Spec.Tolerations...)
 
 		processedFlvs.Insert(flvRef)
@@ -150,6 +167,28 @@ func (podSetInfo *PodSetInfo) AddOrUpdateLabel(k, v string) {
 	}
 }
 
+// isElasticAdmission reports whether info describes an elastic workload-slice
+// admission.
+func isElasticAdmission(info PodSetInfo) bool {
+	if !features.Enabled(features.ElasticJobsViaWorkloadSlices) {
+		return false
+	}
+	_, elastic := info.Annotations[kueue.WorkloadSliceNameAnnotation]
+	return elastic
+}
+
+// filteredOutAnnotations returns admission annotations that must never be
+// persisted on a shared elastic pod template. consume-provisioning-request
+// names one ProvisioningRequest and changes with every slice, so it is dropped
+// from both the incoming info and the template; the ElasticJobUngater stamps
+// it on each gated Pod instead.
+func filteredOutAnnotations(info PodSetInfo) []string {
+	if features.Enabled(features.ElasticJobsViaWorkloadSlicesForProvisioningRequests) && isElasticAdmission(info) {
+		return []string{autoscaling.ProvisioningRequestPodAnnotationKey}
+	}
+	return nil
+}
+
 // overrideableAnnotations returns the Kueue-owned pod template annotations
 // that Merge may overwrite instead of reporting a conflict. For elastic jobs
 // their values may legitimately change between admissions (e.g. when a new
@@ -157,13 +196,13 @@ func (podSetInfo *PodSetInfo) AddOrUpdateLabel(k, v string) {
 //  1. the workload-slice-name annotation, whenever the
 //     ElasticJobsViaWorkloadSlices feature is enabled, and
 //  2. the workload annotation, only for an elastic admission, identified by
-//     the workload-slice-name annotation being part of the injected info.
+//     workload-slice-name in info.
 func overrideableAnnotations(info PodSetInfo) []string {
 	if !features.Enabled(features.ElasticJobsViaWorkloadSlices) {
 		return nil
 	}
 	annotations := []string{kueue.WorkloadSliceNameAnnotation}
-	if _, elastic := info.Annotations[kueue.WorkloadSliceNameAnnotation]; elastic {
+	if isElasticAdmission(info) {
 		annotations = append(annotations, kueue.WorkloadAnnotation)
 	}
 	return annotations
@@ -172,6 +211,13 @@ func overrideableAnnotations(info PodSetInfo) []string {
 // Merge updates or appends the replica metadata & spec fields based on PodSetInfo.
 // It returns error if there is a conflict.
 func Merge(log logr.Logger, meta *metav1.ObjectMeta, spec *corev1.PodSpec, info PodSetInfo) error {
+	if filteredOut := filteredOutAnnotations(info); len(filteredOut) > 0 {
+		info.Annotations = maps.Clone(info.Annotations)
+		for _, key := range filteredOut {
+			delete(info.Annotations, key)
+			delete(meta.Annotations, key)
+		}
+	}
 	for _, key := range overrideableAnnotations(info) {
 		newValue, found := info.Annotations[key]
 		if !found {

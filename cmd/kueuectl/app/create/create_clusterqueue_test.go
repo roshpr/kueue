@@ -20,7 +20,6 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -56,8 +55,8 @@ func TestCreateClusterQueue(t *testing.T) {
 				},
 			},
 			expected: &kueue.ClusterQueue{
-				TypeMeta:   metav1.TypeMeta{APIVersion: "kueue.x-k8s.io/v1beta2", Kind: "ClusterQueue"},
-				ObjectMeta: metav1.ObjectMeta{Name: "cq1"},
+				APIVersion: "kueue.x-k8s.io/v1beta2", Kind: "ClusterQueue",
+				Name: "cq1",
 				Spec: kueue.ClusterQueueSpec{
 					CohortName:       "cohort",
 					QueueingStrategy: kueue.StrictFIFO,
@@ -98,7 +97,7 @@ func TestParseResourceQuotas(t *testing.T) {
 		quotaArgs          []string
 		borrowingArgs      []string
 		lendingArgs        []string
-		wantErr            error
+		wantErr            string
 		wantResourceGroups []kueue.ResourceGroup
 	}{
 		"should create one resource group with one flavor and nominalQuota set": {
@@ -116,7 +115,22 @@ func TestParseResourceQuotas(t *testing.T) {
 				},
 			},
 		},
-		"should create one resource group with one flavor and borrowingLimit set": {
+		"should create one resource group with hyphenated extended resource name": {
+			quotaArgs: []string{"alpha:example.com/v100-gpu=1;intel.com/sriov-net=2"},
+			wantResourceGroups: []kueue.ResourceGroup{
+				{
+					CoveredResources: []corev1.ResourceName{"example.com/v100-gpu", "intel.com/sriov-net"},
+					Flavors: []kueue.FlavorQuotas{
+						*utiltestingapi.MakeFlavorQuotas("alpha").
+							Resource("example.com/v100-gpu", "1").
+							Resource("intel.com/sriov-net", "2").
+							Obj(),
+					},
+				},
+			},
+		},
+		"should create one resource group with one flavor, zero nominalQuota and borrowingLimit set": {
+			quotaArgs:     []string{"alpha:cpu=0;memory=0"},
 			borrowingArgs: []string{"alpha:cpu=1;memory=1"},
 			wantResourceGroups: []kueue.ResourceGroup{
 				{
@@ -130,19 +144,23 @@ func TestParseResourceQuotas(t *testing.T) {
 				},
 			},
 		},
-		"should create one resource group with one flavor and lendingLimit set": {
+		"should fail when a flavor is set in borrowingLimit without nominalQuota": {
+			borrowingArgs: []string{"alpha:cpu=1;memory=1"},
+			wantErr:       `misconfigured flavor "alpha": flavor is set in --borrowing-limit but has no matching --nominal-quota`,
+		},
+		"should fail when a flavor is set in lendingLimit without nominalQuota": {
 			lendingArgs: []string{"alpha:cpu=1;memory=1"},
-			wantResourceGroups: []kueue.ResourceGroup{
-				{
-					CoveredResources: []corev1.ResourceName{"cpu", "memory"},
-					Flavors: []kueue.FlavorQuotas{
-						*utiltestingapi.MakeFlavorQuotas("alpha").
-							Resource("cpu", "0", "", "1").
-							Resource("memory", "0", "", "1").
-							Obj(),
-					},
-				},
-			},
+			wantErr:     `misconfigured flavor "alpha": flavor is set in --lending-limit but has no matching --nominal-quota`,
+		},
+		"should fail when a flavor is set in both borrowingLimit and lendingLimit without nominalQuota": {
+			borrowingArgs: []string{"alpha:cpu=1"},
+			lendingArgs:   []string{"alpha:cpu=1;memory=1"},
+			wantErr:       `misconfigured flavor "alpha": flavor is set in --borrowing-limit but has no matching --nominal-quota`,
+		},
+		"should fail when a flavor in borrowingLimit does not match any flavor in nominalQuota": {
+			quotaArgs:     []string{"alpha:cpu=1"},
+			borrowingArgs: []string{"beta:cpu=1"},
+			wantErr:       `misconfigured flavor "beta": flavor is set in --borrowing-limit but has no matching --nominal-quota`,
 		},
 		"should create one resource group with two flavors and nominalQuota set": {
 			quotaArgs: []string{"alpha:example.com/gpu=1", "beta:example.com/gpu=2"},
@@ -160,7 +178,7 @@ func TestParseResourceQuotas(t *testing.T) {
 				},
 			},
 		},
-		"should create one resource group when flavors listing resources in different order": {
+		"should create one resource group when flavors list resources in different order": {
 			quotaArgs: []string{"alpha:cpu=1;memory=1", "beta:memory=2;cpu=2"},
 			wantResourceGroups: []kueue.ResourceGroup{
 				{
@@ -171,8 +189,28 @@ func TestParseResourceQuotas(t *testing.T) {
 							Resource("memory", "1").
 							Obj(),
 						*utiltestingapi.MakeFlavorQuotas("beta").
-							Resource("memory", "2").
 							Resource("cpu", "2").
+							Resource("memory", "2").
+							Obj(),
+					},
+				},
+			},
+		},
+		"should keep borrowingLimit and lendingLimit on their resources when flavors list resources in different order": {
+			quotaArgs:     []string{"alpha:cpu=1;memory=1", "beta:memory=2;cpu=2"},
+			borrowingArgs: []string{"beta:cpu=1"},
+			lendingArgs:   []string{"beta:memory=1"},
+			wantResourceGroups: []kueue.ResourceGroup{
+				{
+					CoveredResources: []corev1.ResourceName{"cpu", "memory"},
+					Flavors: []kueue.FlavorQuotas{
+						*utiltestingapi.MakeFlavorQuotas("alpha").
+							Resource("cpu", "1").
+							Resource("memory", "1").
+							Obj(),
+						*utiltestingapi.MakeFlavorQuotas("beta").
+							Resource("cpu", "2", "1").
+							Resource("memory", "2", "", "1").
 							Obj(),
 					},
 				},
@@ -312,38 +350,180 @@ func TestParseResourceQuotas(t *testing.T) {
 				},
 			},
 		},
+		"should create one resource group when the resources spec has a trailing semicolon": {
+			quotaArgs: []string{"alpha:cpu=1;memory=1;"},
+			wantResourceGroups: []kueue.ResourceGroup{
+				{
+					CoveredResources: []corev1.ResourceName{"cpu", "memory"},
+					Flavors: []kueue.FlavorQuotas{
+						*utiltestingapi.MakeFlavorQuotas("alpha").
+							Resource("cpu", "1").
+							Resource("memory", "1").
+							Obj(),
+					},
+				},
+			},
+		},
 		"should fail to create a resource group with an invalid flavor and one quota set": {
 			quotaArgs: []string{"alpha:cpu=1;memory=1", "alpha:example.com/gpu=2"},
-			wantErr:   errInvalidFlavor,
+			wantErr:   `misconfigured flavor "alpha": flavor is specified more than once in --nominal-quota`,
 		},
 		"should fail to create when one resource is shared by multiple resource groups": {
 			quotaArgs: []string{"alpha:cpu=1;memory=1", "beta:cpu=1"},
-			wantErr:   errInvalidResourceGroup,
+			wantErr:   `invalid resource group: flavor "beta" covers [cpu] but flavor "alpha" covers [cpu memory]; flavors that share a resource must cover the same resources`,
+		},
+		"should fail to create when a resource is shared by a later larger resource group": {
+			quotaArgs: []string{"alpha:cpu=1", "beta:cpu=1;memory=1"},
+			wantErr:   `invalid resource group: flavor "beta" covers [cpu memory] but flavor "alpha" covers [cpu]; flavors that share a resource must cover the same resources`,
+		},
+		"should fail to create when a resource group overlaps two merged resource groups": {
+			quotaArgs: []string{"alpha:cpu=1", "beta:memory=1", "gamma:cpu=1;memory=1"},
+			wantErr:   `invalid resource group: flavor "gamma" covers [cpu memory] but flavor "alpha" covers [cpu]; flavors that share a resource must cover the same resources`,
+		},
+		"should create separate resource groups for resource names with a common substring": {
+			quotaArgs: []string{"alpha:cpu.example=1", "beta:cpu=1"},
+			wantResourceGroups: []kueue.ResourceGroup{
+				{
+					CoveredResources: []corev1.ResourceName{"cpu.example"},
+					Flavors: []kueue.FlavorQuotas{
+						*utiltestingapi.MakeFlavorQuotas("alpha").
+							Resource("cpu.example", "1").
+							Obj(),
+					},
+				},
+				{
+					CoveredResources: []corev1.ResourceName{"cpu"},
+					Flavors: []kueue.FlavorQuotas{
+						*utiltestingapi.MakeFlavorQuotas("beta").
+							Resource("cpu", "1").
+							Obj(),
+					},
+				},
+			},
+		},
+		"should create separate resource groups whose resource names produce the same dotted string": {
+			quotaArgs: []string{"alpha:a.b=1;c=1", "beta:a=1;b.c=1"},
+			wantResourceGroups: []kueue.ResourceGroup{
+				{
+					CoveredResources: []corev1.ResourceName{"a.b", "c"},
+					Flavors: []kueue.FlavorQuotas{
+						*utiltestingapi.MakeFlavorQuotas("alpha").
+							Resource("a.b", "1").
+							Resource("c", "1").
+							Obj(),
+					},
+				},
+				{
+					CoveredResources: []corev1.ResourceName{"a", "b.c"},
+					Flavors: []kueue.FlavorQuotas{
+						*utiltestingapi.MakeFlavorQuotas("beta").
+							Resource("a", "1").
+							Resource("b.c", "1").
+							Obj(),
+					},
+				},
+			},
 		},
 		"should fail to create a resource group with an invalid flavor and multiple quotas set": {
 			quotaArgs:     []string{"alpha:cpu=1;memory=1"},
 			borrowingArgs: []string{"alpha:example.com/gpu=2"},
-			wantErr:       errInvalidFlavor,
+			wantErr:       `misconfigured flavor "alpha": resource "example.com/gpu" is set in --borrowing-limit but has no matching --nominal-quota`,
+		},
+		"should create one resource group with decimal quantities": {
+			quotaArgs:     []string{"alpha:cpu=1.5;memory=1.5Gi"},
+			borrowingArgs: []string{"alpha:cpu=0.5;memory=2Gi"},
+			wantResourceGroups: []kueue.ResourceGroup{
+				{
+					CoveredResources: []corev1.ResourceName{"cpu", "memory"},
+					Flavors: []kueue.FlavorQuotas{
+						*utiltestingapi.MakeFlavorQuotas("alpha").
+							Resource("cpu", "1.5", "0.5").
+							Resource("memory", "1.5Gi", "2Gi").
+							Obj(),
+					},
+				},
+			},
+		},
+		"should keep borrowingLimit and lendingLimit optional per resource": {
+			quotaArgs:     []string{"alpha:cpu=1;memory=1Gi"},
+			borrowingArgs: []string{"alpha:cpu=2"},
+			lendingArgs:   []string{"alpha:memory=512Mi"},
+			wantResourceGroups: []kueue.ResourceGroup{
+				{
+					CoveredResources: []corev1.ResourceName{"cpu", "memory"},
+					Flavors: []kueue.FlavorQuotas{
+						*utiltestingapi.MakeFlavorQuotas("alpha").
+							Resource("cpu", "1", "2").
+							Resource("memory", "1Gi", "", "512Mi").
+							Obj(),
+					},
+				},
+			},
+		},
+		"should fail when borrowingLimit is set for a resource without nominalQuota": {
+			quotaArgs:     []string{"alpha:cpu=1"},
+			borrowingArgs: []string{"alpha:cpu=2;memory=1Gi"},
+			wantErr:       `misconfigured flavor "alpha": resource "memory" is set in --borrowing-limit but has no matching --nominal-quota`,
+		},
+		"should fail when lendingLimit is set for a resource without nominalQuota": {
+			quotaArgs:   []string{"alpha:cpu=1"},
+			lendingArgs: []string{"alpha:memory=1Gi"},
+			wantErr:     `misconfigured flavor "alpha": resource "memory" is set in --lending-limit but has no matching --nominal-quota`,
+		},
+		"should fail when the same resource is repeated for a flavor within nominalQuota": {
+			quotaArgs: []string{"alpha:cpu=1;memory=1", "alpha:cpu=2"},
+			wantErr:   `misconfigured flavor "alpha": resource "cpu" is specified more than once in --nominal-quota`,
+		},
+		"should fail when the same resource is repeated for a flavor within nominalQuota with a zero value": {
+			quotaArgs: []string{"alpha:cpu=0", "alpha:cpu=1"},
+			wantErr:   `misconfigured flavor "alpha": resource "cpu" is specified more than once in --nominal-quota`,
+		},
+		"should fail when the same resource is repeated for a flavor within borrowingLimit": {
+			quotaArgs:     []string{"alpha:cpu=1"},
+			borrowingArgs: []string{"alpha:cpu=1", "alpha:cpu=2"},
+			wantErr:       `misconfigured flavor "alpha": resource "cpu" is specified more than once in --borrowing-limit`,
 		},
 		"should fail when invalid resource quotas": {
 			quotaArgs: []string{"alpha:cpu=;memory=1"},
-			wantErr:   errInvalidResourcesSpec,
+			wantErr:   "invalid resources specification",
 		},
 		"should fail when invalid resources separator": {
 			quotaArgs: []string{"alpha:cpu=0,memory=1"},
-			wantErr:   errInvalidResourcesSpec,
+			wantErr:   "invalid resources specification",
 		},
 		"should fail when invalid param": {
 			quotaArgs: []string{"alpha"},
-			wantErr:   errInvalidResourcesSpec,
+			wantErr:   "invalid resources specification",
 		},
 		"should fail when invalid flavor specification": {
 			quotaArgs: []string{"alpha=cpu=0;memory=1"},
-			wantErr:   errInvalidResourcesSpec,
+			wantErr:   "invalid resources specification",
 		},
 		"should fail when invalid quantity": {
 			quotaArgs: []string{"alpha:cpu=a;memory=1"},
-			wantErr:   errInvalidResourceQuota,
+			wantErr:   "invalid resource quota",
+		},
+		"should fail when invalid decimal quantity": {
+			quotaArgs: []string{"alpha:cpu=1.5.5;memory=1"},
+			wantErr:   "invalid resource quota",
+		},
+		"should fail when a resource is duplicated within a single nominalQuota spec": {
+			quotaArgs: []string{"alpha:cpu=1;cpu=2;memory=1Gi"},
+			wantErr:   `misconfigured flavor "alpha": resource "cpu" is specified more than once in --nominal-quota`,
+		},
+		"should fail when a resource is duplicated within a single borrowingLimit spec": {
+			quotaArgs:     []string{"alpha:cpu=1;memory=1Gi"},
+			borrowingArgs: []string{"alpha:cpu=1;cpu=2;memory=1Gi"},
+			wantErr:       `misconfigured flavor "alpha": resource "cpu" is specified more than once in --borrowing-limit`,
+		},
+		"should fail when a resource is duplicated within a single lendingLimit spec": {
+			quotaArgs:   []string{"alpha:cpu=1;memory=1Gi"},
+			lendingArgs: []string{"alpha:cpu=1;memory=1Gi;memory=2Gi"},
+			wantErr:     `misconfigured flavor "alpha": resource "memory" is specified more than once in --lending-limit`,
+		},
+		"should fail when a resource is duplicated within a single borrowingLimit spec without nominalQuota": {
+			borrowingArgs: []string{"alpha:cpu=1;cpu=2;memory=1Gi"},
+			wantErr:       `misconfigured flavor "alpha": resource "cpu" is specified more than once in --borrowing-limit`,
 		},
 	}
 	for name, tc := range testCases {
@@ -355,10 +535,14 @@ func TestParseResourceQuotas(t *testing.T) {
 			}
 			gotErr := cqOptions.parseResourceGroups()
 
-			if diff := cmp.Diff(tc.wantErr, gotErr, cmpopts.EquateErrors()); diff != "" {
+			var gotErrMessage string
+			if gotErr != nil {
+				gotErrMessage = gotErr.Error()
+			}
+			if diff := cmp.Diff(tc.wantErr, gotErrMessage); diff != "" {
 				t.Errorf("Unexpected error (-want,+got):\n%s", diff)
 			}
-			if diff := cmp.Diff(cqOptions.ResourceGroups, tc.wantResourceGroups); diff != "" {
+			if diff := cmp.Diff(tc.wantResourceGroups, cqOptions.ResourceGroups); diff != "" {
 				t.Errorf("Unexpected ResourceGroups (-want,+got):\n%s", diff)
 			}
 		})

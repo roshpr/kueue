@@ -64,13 +64,23 @@ func (f *fairSharingIterator) hasNext() bool {
 	return len(f.cqToEntry) > 0
 }
 
+// push adds an entry to the running cycle. pop recomputes DRS for every
+// remaining entry on each call, so the entry is ranked against the state at the
+// next pop and needs no reordering step.
+//
+// The entry's ClusterQueue must not already be in cqToEntry, which holds one
+// entry per ClusterQueue: a second push silently replaces the first.
+func (f *fairSharingIterator) push(e *entry) {
+	f.cqToEntry[e.clusterQueueSnapshot] = e
+}
+
 func (f *fairSharingIterator) pop() *entry {
 	cq := f.getCq()
 
 	// CQ has no Cohort. We simply return its workload.
 	if !cq.HasParent() {
 		entry := f.cqToEntry[cq]
-		f.log.V(3).Info("Returning workload from ClusterQueue without Cohort",
+		f.log.V(5).Info("Returning workload from ClusterQueue without Cohort",
 			"clusterQueue", klog.KRef("", string(cq.GetName())),
 			"workload", klog.KObj(entry.Obj))
 		delete(f.cqToEntry, cq)
@@ -85,7 +95,7 @@ func (f *fairSharingIterator) pop() *entry {
 	log.V(5).Info("Computing DominantResourceShare for tournament")
 	f.entryComparer.computeDRS(root, f.cqToEntry)
 
-	log.V(3).Info("Running tournament to decide next workload to consider in scheduling cycle")
+	log.V(5).Info("Running tournament to decide next workload to consider in scheduling cycle")
 	entry := runTournament(root, f.entryComparer, f.cqToEntry)
 
 	log = log.WithValues(

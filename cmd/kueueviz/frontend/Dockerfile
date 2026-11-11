@@ -3,13 +3,16 @@
 # linux/ppc64le or linux/s390x; running the build on BUILDPLATFORM keeps the
 # bundler off those archs entirely. The build output is static JS/CSS, so it
 # is architecture-agnostic.
-FROM --platform=${BUILDPLATFORM} node:26-slim@sha256:c0753125a3789977aefe869cbebccf70e3cfd7ea84ca48547458f02e4f1d7146 AS builder
+FROM --platform=${BUILDPLATFORM} node:26-slim@sha256:e4db4c914bf8ad241bd24804fc25d272d89bad97e68cdc8a1414862790a02c39 AS builder
 
 WORKDIR /app
 
+# The `retry` build context is passed by the kueueviz-image-build Makefile target.
+COPY --from=retry retry.sh /usr/local/bin/retry.sh
+
 COPY package*.json ./
 
-RUN npm install
+RUN retry.sh --attempts 5 --delay 5 --stream -- npm install
 
 COPY . .
 
@@ -18,14 +21,14 @@ RUN npm run build
 # Install `serve` into a self-contained prefix on BUILDPLATFORM. `serve` is
 # pure JavaScript, so its node_modules tree can be copied verbatim into the
 # target-arch runtime image without re-running npm there.
-RUN npm install --prefix /opt/serve \
+RUN retry.sh --attempts 5 --delay 5 --stream -- npm install --prefix /opt/serve \
   "serve@$(node -p "require('./package-lock.json').packages['node_modules/serve'].version")"
 
 # Runtime stage uses TARGETPLATFORM so the produced image carries correct
 # arch metadata for the multi-arch manifest. It contains no RUN steps, so
 # building it for ppc64le/s390x does not require QEMU binfmt_misc on the
 # build host — only file copies happen.
-FROM --platform=${TARGETPLATFORM} node:26-slim@sha256:c0753125a3789977aefe869cbebccf70e3cfd7ea84ca48547458f02e4f1d7146 AS runtime
+FROM --platform=${TARGETPLATFORM} node:26-slim@sha256:e4db4c914bf8ad241bd24804fc25d272d89bad97e68cdc8a1414862790a02c39 AS runtime
 
 WORKDIR /app
 

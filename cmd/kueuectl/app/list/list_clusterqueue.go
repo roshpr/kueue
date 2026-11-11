@@ -37,7 +37,7 @@ import (
 )
 
 var (
-	cqLong = templates.LongDesc(`
+	cqLong = listLongDesc(`
 		Lists all ClusterQueues, potentially limiting output to those
 		that are active/inactive and matching the label selector.
 	`)
@@ -172,6 +172,7 @@ func (o *ClusterQueueOptions) Run(ctx context.Context) error {
 	}
 
 	tabWriter := printers.GetNewTabWriter(o.Out)
+	pager := newPagedListPrinter(o.PrintFlags.OutputFlagSpecified())
 
 	for {
 		headers := totalCount == 0
@@ -190,7 +191,7 @@ func (o *ClusterQueueOptions) Run(ctx context.Context) error {
 			return err
 		}
 
-		if err := printer.PrintObj(list, tabWriter); err != nil {
+		if err := pager.printPage(list, list.Continue == "", printer, tabWriter); err != nil {
 			return err
 		}
 

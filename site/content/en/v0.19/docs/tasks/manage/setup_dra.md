@@ -142,7 +142,10 @@ auto-discovers the mapping by indexing `DeviceClass` objects.
 ### 2. Add the extended resource to your ClusterQueue
 
 The `coveredResources` must include the extended resource name that matches
-`spec.extendedResourceName` on the `DeviceClass`:
+`spec.extendedResourceName` on the `DeviceClass`. Where a `deviceClassMappings`
+entry remaps that name, only the containers' request moves to the mapped name, so
+cover that one alongside the original, which still carries a chargeable Pod
+overhead or a resource-transformation output written to it.
 
 {{< include "v0.19/examples/dra/sample-dra-queues.yaml" "yaml" >}}
 
@@ -264,6 +267,12 @@ find enough devices matching the `deviceSelector` CEL expression. This can
 happen if `ResourceSlice` objects are not yet populated (e.g., during driver
 startup or node registration). Verify that ResourceSlices exist and contain
 devices matching your selector.
+Like the DRA allocator, Kueue only counts devices from pools that are complete
+and valid at their latest generation. A pool is invalid when two of its
+devices have the same name, two counter sets have the same name, or a device
+consumes a counter set or counter that no slice of the pool publishes in
+`sharedCounters`. Raise the Kueue log verbosity to 4 to see which pools are
+skipped and why.
 
 **Workload rejected with "no consumesCounters entry for counter"**: The
 devices in `ResourceSlice` objects do not have a `consumesCounters` entry

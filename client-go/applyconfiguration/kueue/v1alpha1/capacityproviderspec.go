@@ -27,13 +27,17 @@ import (
 type CapacityProviderSpecApplyConfiguration struct {
 	// orchestratedFlavors identifies the ResourceFlavors for which this provider may
 	// publish capacity. DQO ignores entries in status.capacity.flavors whose
-	// names are not listed here.
+	// names are not listed here. The provider orchestrates all resources of the
+	// listed flavors: capacity that is not reported for a listed flavor is zero.
+	//
 	OrchestratedFlavors []CapacityProviderOrchestratedFlavorApplyConfiguration `json:"orchestratedFlavors,omitempty"`
 	// controllerName identifies the controller publishing capacity.
 	// This field is immutable.
+	//
 	ControllerName *kueuev1alpha1.CapacityProviderControllerName `json:"controllerName,omitempty"`
 	// parameters optionally references implementation-specific configuration.
 	// DQO does not read or validate the referenced object.
+	//
 	Parameters *CapacityProviderParametersReferenceApplyConfiguration `json:"parameters,omitempty"`
 }
 

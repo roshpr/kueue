@@ -48,13 +48,6 @@ var (
 	_ jobframework.MultiKueueWatcher = (*Adapter)(nil)
 )
 
-// NewAdapter creates a new adapter for the given GVK.
-func NewAdapter(gvk schema.GroupVersionKind) jobframework.MultiKueueAdapter {
-	return &Adapter{
-		gvk: gvk,
-	}
-}
-
 // SyncJob synchronizes a job resource between the local and remote clusters.
 // It ensures that the remote cluster has a corresponding object for the local job,
 // creating it if necessary, and updates the status of the local object based on the remote object.
@@ -118,8 +111,7 @@ func cloneUnstructuredForCreation(obj *unstructured.Unstructured) (*unstructured
 		}
 	}
 
-	cleaned := api.CloneObjectMetaForCreation(&meta)
-	cleanedMeta, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&cleaned)
+	cleanedMeta, err := runtime.DefaultUnstructuredConverter.ToUnstructured(new(api.CloneObjectMetaForCreation(&meta)))
 	if err != nil {
 		return nil, fmt.Errorf("converting cleaned metadata to unstructured: %w", err)
 	}

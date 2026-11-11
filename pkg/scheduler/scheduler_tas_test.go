@@ -18,8 +18,11 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -31,11 +34,13 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/component-base/featuregate"
 	"k8s.io/klog/v2"
 	testingclock "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -43,9 +48,13 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
+	"sigs.k8s.io/kueue/pkg/cache/scheduler/podtracker"
+	"sigs.k8s.io/kueue/pkg/cache/scheduler/simulator"
 	"sigs.k8s.io/kueue/pkg/cache/scheduler/was"
+	"sigs.k8s.io/kueue/pkg/constants"
 	tasindexer "sigs.k8s.io/kueue/pkg/controller/tas/indexer"
 	"sigs.k8s.io/kueue/pkg/features"
+	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
 	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
 	"sigs.k8s.io/kueue/pkg/util/routine"
 	"sigs.k8s.io/kueue/pkg/util/slices"
@@ -55,7 +64,230 @@ import (
 	testingnode "sigs.k8s.io/kueue/pkg/util/testingjobs/node"
 	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
 	"sigs.k8s.io/kueue/pkg/workload"
+	"sigs.k8s.io/kueue/pkg/workloadslicing"
 )
+
+func TestShouldFailFastTASReplacement(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	wl := utiltestingapi.MakeWorkload("wl", "default").
+		UnhealthyNodes("x1", "x2").
+		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").
+			PodSets(utiltestingapi.MakePodSetAssignment("main").
+				Count(2).
+				TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+					Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+					Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+					Obj()).
+				Obj()).
+			Obj(), now).
+		AdmittedAt(true, now).
+		Obj()
+	cases := map[string]struct {
+		multipleNodes bool
+		failFast      bool
+		mode          flavorassigner.FlavorAssignmentMode
+		wantFailFast  bool
+	}{
+		"both gates disabled": {
+			mode: flavorassigner.NoFit,
+		},
+		"multiple-node replacement enabled and fail-fast disabled": {
+			multipleNodes: true,
+			mode:          flavorassigner.NoFit,
+		},
+		"multiple-node replacement disabled and fail-fast enabled": {
+			failFast:     true,
+			mode:         flavorassigner.NoFit,
+			wantFailFast: true,
+		},
+		"both gates enabled": {
+			multipleNodes: true,
+			failFast:      true,
+			mode:          flavorassigner.NoFit,
+			wantFailFast:  true,
+		},
+		"both gates enabled with a fitting replacement": {
+			multipleNodes: true,
+			failFast:      true,
+			mode:          flavorassigner.Fit,
+		},
+		"both gates enabled with a replacement requiring preemption": {
+			multipleNodes: true,
+			failFast:      true,
+			mode:          flavorassigner.Preempt,
+			wantFailFast:  true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.TASReplaceMultipleFailedNodes, tc.multipleNodes)
+			features.SetFeatureGateDuringTest(t, features.TASFailedNodeReplacementFailFast, tc.failFast)
+			if got := shouldFailFastTASReplacement(wl, tc.mode); got != tc.wantFailFast {
+				t.Errorf("shouldFailFastTASReplacement() = %v, want %v", got, tc.wantFailFast)
+			}
+		})
+	}
+}
+
+func newTryDeferFailedTASReplacementFixture(t *testing.T) (context.Context, logr.Logger, *Scheduler, *schdcache.Snapshot, *entry, *kueue.Workload) {
+	t.Helper()
+	features.SetFeatureGateDuringTest(t, features.TASFailedNodeReplacementFailFast, true)
+
+	ctx, log := utiltesting.ContextWithLog(t)
+	now := time.Now().Truncate(time.Second)
+	topology := *utiltestingapi.MakeDefaultOneLevelTopology("tas-single-level")
+	nodes := []corev1.Node{
+		*testingnode.MakeNode("x6").
+			Label("tas-node", "true").
+			Label("replacement", "x6").
+			Label(corev1.LabelHostname, "x6").
+			StatusAllocatable(corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("2"),
+				corev1.ResourceMemory: resource.MustParse("4Gi"),
+				corev1.ResourcePods:   resource.MustParse("10"),
+			}).
+			Ready().Obj(),
+	}
+	flavor := *utiltestingapi.MakeResourceFlavor("tas-default").
+		NodeLabel("tas-node", "true").
+		TopologyName(topology.Name).
+		Obj()
+	clusterQueue := *utiltestingapi.MakeClusterQueue("tas-main").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas(flavor.Name).
+			Resource(corev1.ResourceCPU, "2").
+			Resource(corev1.ResourceMemory, "4Gi").
+			Obj()).
+		Obj()
+	victim := *utiltestingapi.MakeWorkload("victim", "default").
+		UID("wl-victim").
+		Queue("tas-main").
+		PodSets(*utiltestingapi.MakePodSet("one", 1).
+			RequiredTopologyRequest(corev1.LabelHostname).
+			Request(corev1.ResourceCPU, "2").
+			Obj()).
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("tas-main").
+				PodSets(utiltestingapi.MakePodSetAssignment("one").
+					Assignment(corev1.ResourceCPU, "tas-default", "2").
+					TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&topology)).
+						Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x6"}, 1).Obj()).
+						Obj()).
+					Obj()).
+				Obj(), now,
+		).
+		AdmittedAt(true, now).
+		Condition(metav1.Condition{
+			Type:               kueue.WorkloadEvicted,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Preempted",
+			Message:            "Preempted to accommodate a workload",
+			LastTransitionTime: metav1.NewTime(now),
+		}).
+		SchedulingStatsEviction(kueue.WorkloadSchedulingStatsEviction{Reason: "Preempted", Count: 1}).
+		Obj()
+	foo := *utiltestingapi.MakeWorkload("foo", "default").
+		UID("wl-foo").
+		UnhealthyNodes("x0").
+		Queue("tas-main").
+		PodSets(*utiltestingapi.MakePodSet("one", 1).
+			RequiredTopologyRequest(corev1.LabelHostname).
+			NodeSelector(map[string]string{"replacement": "x6"}).
+			Request(corev1.ResourceCPU, "2").
+			Obj()).
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("tas-main").
+				PodSets(utiltestingapi.MakePodSetAssignment("one").
+					Assignment(corev1.ResourceCPU, "tas-default", "2").
+					TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&topology)).
+						Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x0"}, 1).Obj()).
+						Obj()).
+					Obj()).
+				Obj(), now,
+		).
+		AdmittedAt(true, now).
+		Obj()
+
+	cl := utiltesting.NewClientBuilder().
+		WithLists(
+			&corev1.NodeList{Items: nodes},
+			&kueue.TopologyList{Items: []kueue.Topology{topology}},
+			&kueue.WorkloadList{Items: []kueue.Workload{victim, foo}},
+		).
+		Build()
+	cqCache := schdcache.New(cl)
+	for i := range nodes {
+		cqCache.TASCache().SyncNode(&nodes[i])
+	}
+	cqCache.AddOrUpdateResourceFlavor(log, &flavor)
+	cqCache.AddOrUpdateTopology(log, &topology)
+	if err := cqCache.AddClusterQueue(ctx, &clusterQueue); err != nil {
+		t.Fatalf("Adding ClusterQueue: %v", err)
+	}
+	for _, w := range []*kueue.Workload{&victim, &foo} {
+		if !cqCache.AddOrUpdateWorkload(ctx, log, w) {
+			t.Fatalf("Adding Workload %s", w.Name)
+		}
+	}
+	snapshot, err := cqCache.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Taking snapshot: %v", err)
+	}
+	qManager := qcache.NewManagerForUnitTests(cl, cqCache)
+	scheduler := New(qManager, cqCache, cl, &utiltesting.EventRecorder{}, WithFailedTASReplacementRecoveryTimeout(ptr.To(time.Minute)))
+	e := &entry{
+		Info:                 *workload.NewInfo(log, &foo),
+		clusterQueueSnapshot: snapshot.ClusterQueue("tas-main"),
+	}
+	return ctx, log, scheduler, snapshot, e, &victim
+}
+
+// TestTryDeferFailedTASReplacementRestoresVictim verifies that the deferral
+// simulation restores the victim workload in the shared snapshot before the
+// next scheduler entry can observe it. A full scheduling pass cannot catch
+// this: assignments are computed during nomination, before the deferral runs.
+func TestTryDeferFailedTASReplacementRestoresVictim(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeReplacementDeferFailFastWhenUsefulInflightEvictions, true)
+	ctx, log, scheduler, snapshot, e, victim := newTryDeferFailedTASReplacementFixture(t)
+	if !scheduler.tryDeferFailedTASReplacement(ctx, log, e, snapshot) {
+		t.Fatal("tryDeferFailedTASReplacement() = false, want true")
+	}
+	if got := snapshot.ClusterQueue("tas-main").Workloads[workload.Key(victim)]; got == nil || len(got.Usage().Quota.Assigned) == 0 {
+		t.Fatal("victim is missing or has no usage in the snapshot after deferral; the simulated usage was not restored")
+	}
+}
+
+func TestTryDeferFailedTASReplacementHonorsGuards(t *testing.T) {
+	// Use the real fixture so each guard is exercised without relying on a
+	// nil-snapshot panic to fail.
+	cases := map[string]struct {
+		gate    bool
+		timeout time.Duration
+		want    bool
+	}{
+		"enabled": {
+			gate:    true,
+			timeout: time.Minute,
+			want:    true,
+		},
+		"feature gate disabled": {
+			gate:    false,
+			timeout: time.Minute,
+		},
+		"zero recovery timeout": {
+			gate: true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.TASNodeReplacementDeferFailFastWhenUsefulInflightEvictions, tc.gate)
+			ctx, log, scheduler, snapshot, e, _ := newTryDeferFailedTASReplacementFixture(t)
+			scheduler.failedTASReplacementRecoveryTimeout = tc.timeout
+			if got := scheduler.tryDeferFailedTASReplacement(ctx, log, e, snapshot); got != tc.want {
+				t.Fatalf("tryDeferFailedTASReplacement() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
 
 func TestScheduleForTAS(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
@@ -250,30 +482,7 @@ func TestScheduleForTAS(t *testing.T) {
 		*utiltestingapi.MakeLocalQueue("tas-main", "default").ClusterQueue("tas-main").Obj(),
 	}
 	eventIgnoreMessage := cmpopts.IgnoreFields(utiltesting.EventRecord{}, "Message")
-	cases := map[string]struct {
-		resourceTransformations []config.ResourceTransformation
-		nodes                   []corev1.Node
-		pods                    []corev1.Pod
-		topologies              []kueue.Topology
-		admissionChecks         []kueue.AdmissionCheck
-		resourceFlavors         []kueue.ResourceFlavor
-		clusterQueues           []kueue.ClusterQueue
-		workloads               []kueue.Workload
-		patchStatusErr          error
-
-		// wantNewAssignments is a summary of all new admissions in the cache after this cycle.
-		wantNewAssignments map[workload.Reference]kueue.Admission
-		// wantLeft is the workload keys that are left in the queues after this cycle.
-		wantLeft map[kueue.ClusterQueueReference][]workload.Reference
-		// wantInadmissibleLeft is the workload keys that are left in the inadmissible state after this cycle.
-		wantInadmissibleLeft map[kueue.ClusterQueueReference][]workload.Reference
-		// wantEvents asserts on the events, the comparison options are passed by eventCmpOpts
-		wantEvents []utiltesting.EventRecord
-		// eventCmpOpts are the comparison options for the events
-		eventCmpOpts cmp.Options
-
-		featureGates map[featuregate.Feature]bool
-	}{
+	cases := map[string]tasScheduleForTASCase{
 		"initial scheduling; one-byte memory request fits on a 2Gi node with vectorized requests disabled": {
 			nodes: []corev1.Node{
 				*testingnode.MakeNode("x1").
@@ -315,6 +524,38 @@ func TestScheduleForTAS(t *testing.T) {
 			},
 			featureGates: map[featuregate.Feature]bool{
 				features.VectorizedResourceRequests: false,
+			},
+		},
+		"initial scheduling; a PodSet whose Pods request nothing gets a free Pod slot": {
+			nodes:           defaultSingleNode,
+			topologies:      []kueue.Topology{defaultSingleLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASFlavor},
+			clusterQueues: []kueue.ClusterQueue{*utiltestingapi.MakeClusterQueue("tas-main").
+				ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").
+					Resource(corev1.ResourcePods, "10").Obj()).
+				Obj()},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("no-requests", "default").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Obj()).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/no-requests": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(utiltestingapi.MakePodSetAssignment("one").
+						Assignment(corev1.ResourcePods, "tas-default", "1").
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+							Obj()).
+						Obj()).
+					Obj(),
+			},
+			eventCmpOpts: cmp.Options{eventIgnoreMessage},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "no-requests", "QuotaReserved", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "no-requests", "Admitted", corev1.EventTypeNormal).Obj(),
 			},
 		},
 		// Verifies TAS reads memory from PodSpec (1.5Gi/pod) not from quota-derived values.
@@ -473,6 +714,51 @@ func TestScheduleForTAS(t *testing.T) {
 				utiltesting.MakeEventRecord("default", "foo", "Admitted", corev1.EventTypeNormal).Obj(),
 			},
 		},
+		"workload in CQ with ProvisioningRequest; second pass; reports reservation wait time": {
+			nodes:           defaultSingleNode,
+			admissionChecks: []kueue.AdmissionCheck{defaultProvCheck},
+			topologies:      []kueue.Topology{defaultSingleLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASFlavor},
+			clusterQueues:   []kueue.ClusterQueue{clusterQueueWithProvReq},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "1000m").
+								DelayedTopologyRequest(kueue.DelayedTopologyRequestStatePending).
+								Obj()).
+							Obj(),
+						now.Add(-30*time.Second),
+					).
+					AdmissionCheck(kueue.AdmissionCheckState{
+						Name:  "prov-check",
+						State: kueue.CheckStateReady,
+					}).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(utiltestingapi.MakePodSetAssignment("one").
+						Assignment(corev1.ResourceCPU, "tas-default", "1000m").
+						DelayedTopologyRequest(kueue.DelayedTopologyRequestStateReady).
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+							Obj()).
+						Obj()).
+					Obj(),
+			},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "foo", "Admitted", corev1.EventTypeNormal).
+					Message("Admitted by ClusterQueue tas-main, wait time since reservation was 31s").
+					Obj(),
+			},
+		},
 		"workload in CQ with ProvisioningRequest; second pass; multi-resource workload fully consumes quota": {
 			// Verifies the second pass does not re-fit a multi-resource
 			// workload against quota that already includes its own first-pass
@@ -531,6 +817,101 @@ func TestScheduleForTAS(t *testing.T) {
 			eventCmpOpts: cmp.Options{eventIgnoreMessage},
 			wantEvents: []utiltesting.EventRecord{
 				utiltesting.MakeEventRecord("default", "foo", "Admitted", corev1.EventTypeNormal).Obj(),
+			},
+		},
+		"workload in CQ with ProvisioningRequest; second pass; preempts under a pods quota": {
+			// foo only fits on x1 once blocker is gone. Its reservation already counts
+			// its Pods; counted twice, they would exceed the pods quota even without
+			// blocker, and nothing would be preempted.
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label("tas-node", "true").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("3"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			admissionChecks: []kueue.AdmissionCheck{defaultProvCheck},
+			topologies:      []kueue.Topology{defaultSingleLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASFlavor},
+			clusterQueues: []kueue.ClusterQueue{
+				*utiltestingapi.MakeClusterQueue("tas-main").
+					Preemption(kueue.ClusterQueuePreemption{WithinClusterQueue: kueue.PreemptionPolicyLowerPriority}).
+					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").
+						Resource(corev1.ResourceCPU, "10").
+						Resource(corev1.ResourcePods, "8").Obj()).
+					AdmissionChecks(kueue.AdmissionCheckReference(defaultProvCheck.Name)).
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 3).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(
+								utiltestingapi.MakePodSetAssignment("one").
+									Assignment(corev1.ResourceCPU, "tas-default", "3").
+									Assignment(corev1.ResourcePods, "tas-default", "3").
+									Count(3).
+									DelayedTopologyRequest(kueue.DelayedTopologyRequestStatePending).
+									Obj(),
+							).
+							Obj(), now,
+					).
+					AdmissionCheck(kueue.AdmissionCheckState{
+						Name:  "prov-check",
+						State: kueue.CheckStateReady,
+					}).
+					Obj(),
+				*utiltestingapi.MakeWorkload("blocker", "default").
+					Queue("tas-main").
+					Priority(-1).
+					PodSets(*utiltestingapi.MakePodSet("one", 2).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(
+								utiltestingapi.MakePodSetAssignment("one").
+									Assignment(corev1.ResourceCPU, "tas-default", "2").
+									Assignment(corev1.ResourcePods, "tas-default", "2").
+									Count(2).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).
+										Obj()).
+									Obj(),
+							).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(
+						utiltestingapi.MakePodSetAssignment("one").
+							Assignment(corev1.ResourceCPU, "tas-default", "3").
+							Assignment(corev1.ResourcePods, "tas-default", "3").
+							Count(3).
+							DelayedTopologyRequest(kueue.DelayedTopologyRequestStatePending).
+							Obj(),
+					).
+					Obj(),
+			},
+			eventCmpOpts: cmp.Options{eventIgnoreMessage},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "blocker", "EvictedDueToPreempted", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "blocker", "Preempted", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "foo", "PreemptedWorkload", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "foo", "SecondPassFailed", corev1.EventTypeWarning).Obj(),
 			},
 		},
 		"workload in CQ with two TAS flavors, only the second is using Provisioning Admission Check": {
@@ -693,6 +1074,925 @@ func TestScheduleForTAS(t *testing.T) {
 				utiltesting.MakeEventRecord("default", "contender", "Admitted", corev1.EventTypeNormal).Obj(),
 			},
 		},
+		"PodSet group; node replacement; the leader stays in the rack of the remaining worker": {
+			// The leader and one worker ran on the failed node x1. The other worker on x2
+			// pins the group to r1, although r2 is the tighter fit for the leader alone.
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("2"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					NotReady().
+					Obj(),
+				*testingnode.MakeNode("x2").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x2").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x3").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x3").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x4").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x4").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x6").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r2").
+					Label(corev1.LabelHostname, "x6").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			topologies:      []kueue.Topology{defaultTwoLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASTwoLevelFlavor},
+			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueue},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					UnhealthyNodes("x1").
+					Queue("tas-main").
+					PodSets(
+						*utiltestingapi.MakePodSet("leader", 1).
+							RequiredTopologyRequest(tasRackLabel).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltestingapi.MakePodSet("worker", 2).
+							RequiredTopologyRequest(tasRackLabel).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(
+								utiltestingapi.MakePodSetAssignment("leader").
+									Assignment(corev1.ResourceCPU, "tas-default", "1").
+									Count(1).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+										Obj()).
+									Obj(),
+								utiltestingapi.MakePodSetAssignment("worker").
+									Assignment(corev1.ResourceCPU, "tas-default", "2").
+									Count(2).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+										Obj()).
+									Obj(),
+							).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(
+						utiltestingapi.MakePodSetAssignment("leader").
+							Assignment(corev1.ResourceCPU, "tas-default", "1").
+							Count(1).
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x3"}, 1).Obj()).
+								Obj()).
+							Obj(),
+						utiltestingapi.MakePodSetAssignment("worker").
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							Count(2).
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x4"}, 1).Obj()).
+								Obj()).
+							Obj(),
+					).
+					Obj(),
+			},
+		},
+		"PodSet group; node replacement; evicted when the rack of the workers has no room for the leader": {
+			// The leader ran alone on the failed node x1. The workers on x2 and x3 pin the
+			// group to r1, which has no free node, so the Workload is evicted instead of
+			// moving the leader to r2.
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					NotReady().
+					Obj(),
+				*testingnode.MakeNode("x2").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x2").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x3").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x3").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x6").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r2").
+					Label(corev1.LabelHostname, "x6").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x7").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r2").
+					Label(corev1.LabelHostname, "x7").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			topologies:      []kueue.Topology{defaultTwoLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASTwoLevelFlavor},
+			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueue},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					UnhealthyNodes("x1").
+					Queue("tas-main").
+					PodSets(
+						*utiltestingapi.MakePodSet("leader", 1).
+							RequiredTopologyRequest(tasRackLabel).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltestingapi.MakePodSet("worker", 2).
+							RequiredTopologyRequest(tasRackLabel).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(
+								utiltestingapi.MakePodSetAssignment("leader").
+									Assignment(corev1.ResourceCPU, "tas-default", "1").
+									Count(1).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+										Obj()).
+									Obj(),
+								utiltestingapi.MakePodSetAssignment("worker").
+									Assignment(corev1.ResourceCPU, "tas-default", "2").
+									Count(2).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x3"}, 1).Obj()).
+										Obj()).
+									Obj(),
+							).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(
+						utiltestingapi.MakePodSetAssignment("leader").
+							Assignment(corev1.ResourceCPU, "tas-default", "1").
+							Count(1).
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+								Obj()).
+							Obj(),
+						utiltestingapi.MakePodSetAssignment("worker").
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							Count(2).
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x3"}, 1).Obj()).
+								Obj()).
+							Obj(),
+					).
+					Obj(),
+			},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "foo", "EvictedDueToNodeFailures", corev1.EventTypeNormal).
+					Message("Workload was evicted as there was no replacement for unhealthy node(s): x1").Obj(),
+			},
+		},
+		"PodSet group; node replacement; the workers stay in the rack of the leader": {
+			// Both workers ran on the failed node x1, so only the leader on x2 pins the
+			// group to r1, although r2 is the tighter fit for the workers alone.
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("2"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					NotReady().
+					Obj(),
+				*testingnode.MakeNode("x2").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x2").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x3").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x3").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x4").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x4").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x5").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x5").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x6").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r2").
+					Label(corev1.LabelHostname, "x6").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x7").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r2").
+					Label(corev1.LabelHostname, "x7").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			topologies:      []kueue.Topology{defaultTwoLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASTwoLevelFlavor},
+			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueue},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					UnhealthyNodes("x1").
+					Queue("tas-main").
+					PodSets(
+						*utiltestingapi.MakePodSet("leader", 1).
+							RequiredTopologyRequest(tasRackLabel).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltestingapi.MakePodSet("worker", 2).
+							RequiredTopologyRequest(tasRackLabel).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(
+								utiltestingapi.MakePodSetAssignment("leader").
+									Assignment(corev1.ResourceCPU, "tas-default", "1").
+									Count(1).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+										Obj()).
+									Obj(),
+								utiltestingapi.MakePodSetAssignment("worker").
+									Assignment(corev1.ResourceCPU, "tas-default", "2").
+									Count(2).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).
+										Obj()).
+									Obj(),
+							).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(
+						utiltestingapi.MakePodSetAssignment("leader").
+							Assignment(corev1.ResourceCPU, "tas-default", "1").
+							Count(1).
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+								Obj()).
+							Obj(),
+						utiltestingapi.MakePodSetAssignment("worker").
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							Count(2).
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x3"}, 1).Obj()).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x4"}, 1).Obj()).
+								Obj()).
+							Obj(),
+					).
+					Obj(),
+			},
+		},
+		"PodSet group; node replacement; the whole group ran on the failed node and is placed again together": {
+			// No Pod of the group remains on a healthy node, so the group is placed again
+			// as a whole. Placing the leader alone would pick r2, the tighter fit.
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("3"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					NotReady().
+					Obj(),
+				*testingnode.MakeNode("x2").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x2").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x3").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x3").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x4").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x4").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x5").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x5").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x6").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r2").
+					Label(corev1.LabelHostname, "x6").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x7").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r2").
+					Label(corev1.LabelHostname, "x7").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			topologies:      []kueue.Topology{defaultTwoLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASTwoLevelFlavor},
+			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueue},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					UnhealthyNodes("x1").
+					Queue("tas-main").
+					PodSets(
+						*utiltestingapi.MakePodSet("leader", 1).
+							RequiredTopologyRequest(tasRackLabel).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltestingapi.MakePodSet("worker", 2).
+							RequiredTopologyRequest(tasRackLabel).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(
+								utiltestingapi.MakePodSetAssignment("leader").
+									Assignment(corev1.ResourceCPU, "tas-default", "1").
+									Count(1).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+										Obj()).
+									Obj(),
+								utiltestingapi.MakePodSetAssignment("worker").
+									Assignment(corev1.ResourceCPU, "tas-default", "2").
+									Count(2).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).
+										Obj()).
+									Obj(),
+							).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(
+						utiltestingapi.MakePodSetAssignment("leader").
+							Assignment(corev1.ResourceCPU, "tas-default", "1").
+							Count(1).
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+								Obj()).
+							Obj(),
+						utiltestingapi.MakePodSetAssignment("worker").
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							Count(2).
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x3"}, 1).Obj()).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x4"}, 1).Obj()).
+								Obj()).
+							Obj(),
+					).
+					Obj(),
+			},
+		},
+		"PodSet group; node replacement; the whole group is placed again with the admitted count of a PodSet with reclaimable Pods": {
+			// One worker already succeeded, but the admission still counts it, so the group
+			// is placed again with as many workers as the previous assignment held.
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("3"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					NotReady().
+					Obj(),
+				*testingnode.MakeNode("x2").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x2").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x3").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x3").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x4").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x4").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x5").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x5").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x6").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r2").
+					Label(corev1.LabelHostname, "x6").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x7").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r2").
+					Label(corev1.LabelHostname, "x7").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			topologies:      []kueue.Topology{defaultTwoLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASTwoLevelFlavor},
+			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueue},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					UnhealthyNodes("x1").
+					Queue("tas-main").
+					PodSets(
+						*utiltestingapi.MakePodSet("leader", 1).
+							RequiredTopologyRequest(tasRackLabel).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltestingapi.MakePodSet("worker", 2).
+							RequiredTopologyRequest(tasRackLabel).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(
+								utiltestingapi.MakePodSetAssignment("leader").
+									Assignment(corev1.ResourceCPU, "tas-default", "1").
+									Count(1).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+										Obj()).
+									Obj(),
+								utiltestingapi.MakePodSetAssignment("worker").
+									Assignment(corev1.ResourceCPU, "tas-default", "2").
+									Count(2).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).
+										Obj()).
+									Obj(),
+							).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					ReclaimablePods(kueue.ReclaimablePod{Name: "worker", Count: 1}).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(
+						utiltestingapi.MakePodSetAssignment("leader").
+							Assignment(corev1.ResourceCPU, "tas-default", "1").
+							Count(1).
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+								Obj()).
+							Obj(),
+						utiltestingapi.MakePodSetAssignment("worker").
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							Count(2).
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x3"}, 1).Obj()).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x4"}, 1).Obj()).
+								Obj()).
+							Obj(),
+					).
+					Obj(),
+			},
+		},
+		"PodSet group; node replacement; a worker left on a healthy node pins its own replacement": {
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					NotReady().
+					Obj(),
+				*testingnode.MakeNode("x2").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x2").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x3").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x3").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x4").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x4").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x5").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x5").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x6").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r2").
+					Label(corev1.LabelHostname, "x6").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			topologies:      []kueue.Topology{defaultTwoLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASTwoLevelFlavor},
+			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueue},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					UnhealthyNodes("x1").
+					Queue("tas-main").
+					PodSets(
+						*utiltestingapi.MakePodSet("leader", 1).
+							RequiredTopologyRequest(tasRackLabel).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltestingapi.MakePodSet("worker", 2).
+							RequiredTopologyRequest(tasRackLabel).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(
+								utiltestingapi.MakePodSetAssignment("leader").
+									Assignment(corev1.ResourceCPU, "tas-default", "1").
+									Count(1).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+										Obj()).
+									Obj(),
+								utiltestingapi.MakePodSetAssignment("worker").
+									Assignment(corev1.ResourceCPU, "tas-default", "2").
+									Count(2).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x3"}, 1).Obj()).
+										Obj()).
+									Obj(),
+							).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(
+						utiltestingapi.MakePodSetAssignment("leader").
+							Assignment(corev1.ResourceCPU, "tas-default", "1").
+							Count(1).
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+								Obj()).
+							Obj(),
+						utiltestingapi.MakePodSetAssignment("worker").
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							Count(2).
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x3"}, 1).Obj()).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x4"}, 1).Obj()).
+								Obj()).
+							Obj(),
+					).
+					Obj(),
+			},
+		},
+		"PodSets without a group; node replacement; a PodSet that lost its only node is placed on its own": {
+			// The PodSets are not grouped, so the PodSet on the failed node x1 may move to
+			// another rack than the other PodSet.
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					NotReady().
+					Obj(),
+				*testingnode.MakeNode("x2").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x2").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x3").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x3").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x4").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x4").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x5").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x5").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x6").
+					Label("tas-node", "true").
+					Label(tasRackLabel, "r2").
+					Label(corev1.LabelHostname, "x6").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			topologies:      []kueue.Topology{defaultTwoLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASTwoLevelFlavor},
+			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueue},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					UnhealthyNodes("x1").
+					Queue("tas-main").
+					PodSets(
+						*utiltestingapi.MakePodSet("a", 1).
+							RequiredTopologyRequest(tasRackLabel).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltestingapi.MakePodSet("b", 2).
+							RequiredTopologyRequest(tasRackLabel).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(
+								utiltestingapi.MakePodSetAssignment("a").
+									Assignment(corev1.ResourceCPU, "tas-default", "1").
+									Count(1).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+										Obj()).
+									Obj(),
+								utiltestingapi.MakePodSetAssignment("b").
+									Assignment(corev1.ResourceCPU, "tas-default", "2").
+									Count(2).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+										Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x3"}, 1).Obj()).
+										Obj()).
+									Obj(),
+							).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(
+						utiltestingapi.MakePodSetAssignment("a").
+							Assignment(corev1.ResourceCPU, "tas-default", "1").
+							Count(1).
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x6"}, 1).Obj()).
+								Obj()).
+							Obj(),
+						utiltestingapi.MakePodSetAssignment("b").
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							Count(2).
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x3"}, 1).Obj()).
+								Obj()).
+							Obj(),
+					).
+					Obj(),
+			},
+		},
 		"workload with unhealthyNode annotation; second pass; baseline scenario": {
 			nodes:           defaultNodes,
 			admissionChecks: []kueue.AdmissionCheck{defaultProvCheck},
@@ -726,6 +2026,51 @@ func TestScheduleForTAS(t *testing.T) {
 						Assignment(corev1.ResourceCPU, "tas-default", "1000m").
 						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
 							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+							Obj()).
+						Obj()).
+					Obj(),
+			},
+		},
+		"workload with unhealthyNode annotation; second pass; reclaimable pods keep the admitted count and usage": {
+			nodes:           defaultNodes,
+			admissionChecks: []kueue.AdmissionCheck{defaultProvCheck},
+			topologies:      []kueue.Topology{defaultThreeLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASThreeLevelFlavor},
+			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueue},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					UnhealthyNodes("x3").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 3).
+						PreferredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "3000m").
+								Count(3).
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x3"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					ReclaimablePods(kueue.ReclaimablePod{Name: "one", Count: 2}).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(utiltestingapi.MakePodSetAssignment("one").
+						Assignment(corev1.ResourceCPU, "tas-default", "3000m").
+						Count(3).
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
+							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x4"}, 1).Obj()).
 							Obj()).
 						Obj()).
 					Obj(),
@@ -858,7 +2203,11 @@ func TestScheduleForTAS(t *testing.T) {
 					Obj(),
 			},
 		},
-		"workload with unhealthyNode annotation; second pass; preferred; no fit; FailFast": {
+		"workload with eight unhealthy nodes; second pass; no fit; FailFast disabled": {
+			featureGates: map[featuregate.Feature]bool{
+				features.TASReplaceMultipleFailedNodes:    true,
+				features.TASFailedNodeReplacementFailFast: false,
+			},
 			nodes:           defaultNodes,
 			admissionChecks: []kueue.AdmissionCheck{defaultProvCheck},
 			topologies:      []kueue.Topology{defaultThreeLevelTopology},
@@ -866,7 +2215,7 @@ func TestScheduleForTAS(t *testing.T) {
 			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueue},
 			workloads: []kueue.Workload{
 				*utiltestingapi.MakeWorkload("foo", "default").
-					UnhealthyNodes("x0").
+					UnhealthyNodes("x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7").
 					Queue("tas-main").
 					PodSets(*utiltestingapi.MakePodSet("one", 1).
 						PreferredTopologyRequest(tasRackLabel).
@@ -896,8 +2245,8 @@ func TestScheduleForTAS(t *testing.T) {
 					Obj(),
 			},
 			wantEvents: []utiltesting.EventRecord{
-				utiltesting.MakeEventRecord("default", "foo", "EvictedDueToNodeFailures", corev1.EventTypeNormal).
-					Message("Workload was evicted as there was no replacement for unhealthy node(s): x0").
+				utiltesting.MakeEventRecord("default", "foo", "SecondPassFailed", corev1.EventTypeWarning).
+					Message(`couldn't assign flavors to pod set one: topology "tas-three-level" doesn't allow to fit any of 1 pod(s). Total nodes: 6; excluded: resource "cpu": 6`).
 					Obj(),
 			},
 		},
@@ -982,6 +2331,255 @@ func TestScheduleForTAS(t *testing.T) {
 				utiltesting.MakeEventRecord("default", "foo", "SecondPassFailed", corev1.EventTypeWarning).
 					Message("couldn't assign flavors to pod set one: topology \"tas-three-level\" doesn't allow to fit any of 1 pod(s). Total nodes: 6; excluded: resource \"cpu\": 6").
 					Obj(),
+			},
+		},
+		// The second pass looks for a replacement domain for the pod on the
+		// unhealthy node x0. Only x6 has enough capacity for the 2-core
+		// replacement, but x6 is occupied by a healthy admitted workload that
+		// is not being evicted, so there is no in-flight eviction to wait for
+		// and the workload is fail-fast evicted.
+		"workload with unhealthyNode annotation; second pass; preferred; no fit; FailFast; no in-flight preemption": {
+			nodes:           defaultNodes,
+			admissionChecks: []kueue.AdmissionCheck{defaultProvCheck},
+			topologies:      []kueue.Topology{defaultThreeLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASThreeLevelFlavor},
+			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueue},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("healthy-occupier", "default").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "2").
+						Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "2000m").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x6"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+				*utiltestingapi.MakeWorkload("foo", "default").
+					UnhealthyNodes("x0").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						PreferredTopologyRequest(tasRackLabel).
+						Request(corev1.ResourceCPU, "2").
+						Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "2000m").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x0"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(utiltestingapi.MakePodSetAssignment("one").
+						Assignment(corev1.ResourceCPU, "tas-default", "2000m").
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x0"}, 1).Obj()).
+							Obj()).
+						Obj()).
+					Obj(),
+			},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "foo", "EvictedDueToNodeFailures", corev1.EventTypeNormal).
+					Message("Workload was evicted as there was no replacement for unhealthy node(s): x0").
+					Obj(),
+			},
+		},
+		// The in-flight eviction victim is on x1, which has only 1 core.
+		// Simulating its removal does not help: x1 still cannot fit the 2-core
+		// replacement and x6 remains occupied by a healthy admitted workload,
+		// so the recomputed assignment is still not a fit and the workload is
+		// fail-fast evicted.
+		"workload with unhealthyNode annotation; second pass; preferred; no fit; FailFast; in-flight preemption in a different domain": {
+			nodes:           defaultNodes,
+			admissionChecks: []kueue.AdmissionCheck{defaultProvCheck},
+			topologies:      []kueue.Topology{defaultThreeLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASThreeLevelFlavor},
+			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueue},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("healthy-occupier", "default").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "2").
+						Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "2000m").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x6"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+				*utiltestingapi.MakeWorkload("victim", "default").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "1000m").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadEvicted,
+						Status:             metav1.ConditionTrue,
+						Reason:             "Preempted",
+						Message:            "Preempted to accommodate a workload",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadPreempted,
+						Status:             metav1.ConditionTrue,
+						Reason:             "InClusterQueue",
+						Message:            "Preempted to accommodate a workload",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					SchedulingStatsEviction(kueue.WorkloadSchedulingStatsEviction{Reason: "Preempted", Count: 1}).
+					Obj(),
+				*utiltestingapi.MakeWorkload("foo", "default").
+					UnhealthyNodes("x0").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						PreferredTopologyRequest(tasRackLabel).
+						Request(corev1.ResourceCPU, "2").
+						Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "2000m").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x0"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(utiltestingapi.MakePodSetAssignment("one").
+						Assignment(corev1.ResourceCPU, "tas-default", "2000m").
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x0"}, 1).Obj()).
+							Obj()).
+						Obj()).
+					Obj(),
+			},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "foo", "EvictedDueToNodeFailures", corev1.EventTypeNormal).
+					Message("Workload was evicted as there was no replacement for unhealthy node(s): x0").
+					Obj(),
+			},
+		},
+		// The in-flight preemption victim occupies x6, the only node that can
+		// fit the 2-core replacement. Simulating its removal frees x6, so the
+		// recomputed assignment fits and the workload is requeued with
+		// PendingPreemption semantics instead of being fail-fast evicted,
+		// keeping its reservation until the eviction completes.
+		"workload with unhealthyNode annotation; second pass; preferred; no fit; in-flight preemption frees capacity; deferred": {
+			featureGates: map[featuregate.Feature]bool{
+				features.TASFailedNodeReplacementFailFast:                           true,
+				features.TASNodeReplacementDeferFailFastWhenUsefulInflightEvictions: true,
+			},
+			nodes:           defaultNodes,
+			admissionChecks: []kueue.AdmissionCheck{defaultProvCheck},
+			topologies:      []kueue.Topology{defaultThreeLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASThreeLevelFlavor},
+			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueue},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("victim", "default").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "2").
+						Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "2000m").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x6"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadEvicted,
+						Status:             metav1.ConditionTrue,
+						Reason:             "Preempted",
+						Message:            "Preempted to accommodate a workload",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadPreempted,
+						Status:             metav1.ConditionTrue,
+						Reason:             "InClusterQueue",
+						Message:            "Preempted to accommodate a workload",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					SchedulingStatsEviction(kueue.WorkloadSchedulingStatsEviction{Reason: "Preempted", Count: 1}).
+					Obj(),
+				*utiltestingapi.MakeWorkload("foo", "default").
+					UnhealthyNodes("x0").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						PreferredTopologyRequest(tasRackLabel).
+						Request(corev1.ResourceCPU, "2").
+						Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "2000m").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x0"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(utiltestingapi.MakePodSetAssignment("one").
+						Assignment(corev1.ResourceCPU, "tas-default", "2000m").
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x0"}, 1).Obj()).
+							Obj()).
+						Obj()).
+					Obj(),
+			},
+			eventCmpOpts: cmp.Options{eventIgnoreMessage},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "foo", "SecondPassFailed", corev1.EventTypeWarning).Obj(),
 			},
 		},
 		"workload with unhealthyNode annotation; second pass; required rack; fit": {
@@ -1104,7 +2702,7 @@ func TestScheduleForTAS(t *testing.T) {
 			},
 			wantEvents: []utiltesting.EventRecord{
 				utiltesting.MakeEventRecord("default", "foo", "SecondPassFailed", corev1.EventTypeWarning).
-					Message(`couldn't assign flavors to pod set one: topology "tas-three-level" doesn't allow to fit any of 1 pod(s). Total nodes: 6; excluded: resource "cpu": 1, topologyDomain: 5`).
+					Message(`couldn't assign flavors to pod set one: topology "tas-three-level" doesn't allow to fit any of 1 pod(s); all pods must fit in a single "cloud.provider.com/rack" topology domain. Total nodes: 6; excluded: resource "cpu": 1, topologyDomain: 5`).
 					Obj(),
 			},
 		},
@@ -2134,7 +3732,7 @@ func TestScheduleForTAS(t *testing.T) {
 			},
 			wantEvents: []utiltesting.EventRecord{
 				utiltesting.MakeEventRecord("default", "foo", kueue.WorkloadQuotaReservedReasonTopologyPlacementFailed, "Warning").
-					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" allows to fit only 1 out of 2 pod(s)`).
+					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" allows to fit only 1 out of 2 pod(s); all pods must fit in a single "kubernetes.io/hostname" topology domain`).
 					Obj(),
 			},
 		},
@@ -2175,7 +3773,7 @@ func TestScheduleForTAS(t *testing.T) {
 			},
 			wantEvents: []utiltesting.EventRecord{
 				utiltesting.MakeEventRecord("default", "foo", kueue.WorkloadQuotaReservedReasonWaitingForQuota, "Warning").
-					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" doesn't allow to fit any of 1 pod(s). Total nodes: 1; excluded: resource "cpu": 1`).
+					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" doesn't allow to fit any of 1 pod(s); all pods must fit in a single "kubernetes.io/hostname" topology domain. Total nodes: 1; excluded: resource "cpu": 1`).
 					Obj(),
 			},
 		},
@@ -2379,7 +3977,7 @@ func TestScheduleForTAS(t *testing.T) {
 			},
 			wantEvents: []utiltesting.EventRecord{
 				utiltesting.MakeEventRecord("default", "foo", kueue.WorkloadQuotaReservedReasonTopologyPlacementFailed, "Warning").
-					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" doesn't allow to fit any of 1 pod(s). Total nodes: 1; excluded: resource "cpu": 1`).
+					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" doesn't allow to fit any of 1 pod(s); all pods must fit in a single "kubernetes.io/hostname" topology domain. Total nodes: 1; excluded: resource "cpu": 1`).
 					Obj(),
 			},
 		},
@@ -2420,7 +4018,7 @@ func TestScheduleForTAS(t *testing.T) {
 			},
 			wantEvents: []utiltesting.EventRecord{
 				utiltesting.MakeEventRecord("default", "foo", kueue.WorkloadQuotaReservedReasonTopologyPlacementFailed, "Warning").
-					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" doesn't allow to fit any of 1 pod(s). Total nodes: 1; excluded: resource "cpu": 1`).
+					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" doesn't allow to fit any of 1 pod(s); all pods must fit in a single "kubernetes.io/hostname" topology domain. Total nodes: 1; excluded: resource "cpu": 1`).
 					Obj(),
 			},
 		},
@@ -3129,7 +4727,7 @@ func TestScheduleForTAS(t *testing.T) {
 			},
 			wantEvents: []utiltesting.EventRecord{
 				utiltesting.MakeEventRecord("default", "foo", kueue.WorkloadQuotaReservedReasonWaitingForQuota, "Warning").
-					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" doesn't allow to fit any of 1 pod(s). Total nodes: 1; excluded: resource "pods": 1`).
+					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" doesn't allow to fit any of 1 pod(s); all pods must fit in a single "kubernetes.io/hostname" topology domain. Total nodes: 1; excluded: resource "pods": 1`).
 					Obj(),
 			},
 		},
@@ -3683,360 +5281,8 @@ func TestScheduleForTAS(t *testing.T) {
 					Obj(),
 			},
 		},
-		"SchedulerLibraryIntegration enabled: generic TAS workload admitted on healthy node": {
-			nodes:           defaultSingleNode,
-			topologies:      []kueue.Topology{defaultSingleLevelTopology},
-			resourceFlavors: []kueue.ResourceFlavor{defaultTASFlavor},
-			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueue},
-			workloads: []kueue.Workload{
-				*utiltestingapi.MakeWorkload("wl", "default").
-					Queue("tas-main").
-					PodSets(*utiltestingapi.MakePodSet("main", 1).
-						RequiredTopologyRequest(corev1.LabelHostname).
-						Request(corev1.ResourceCPU, "1").
-						Obj()).
-					Obj(),
-			},
-			wantNewAssignments: map[workload.Reference]kueue.Admission{
-				"default/wl": *utiltestingapi.MakeAdmission("tas-main").
-					PodSets(utiltestingapi.MakePodSetAssignment("main").
-						Assignment(corev1.ResourceCPU, "tas-default", "1").
-						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
-							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
-							Obj()).
-						Obj()).
-					Obj(),
-			},
-			eventCmpOpts: cmp.Options{eventIgnoreMessage},
-			wantEvents: []utiltesting.EventRecord{
-				utiltesting.MakeEventRecord("default", "wl", "QuotaReserved", corev1.EventTypeNormal).Obj(),
-				utiltesting.MakeEventRecord("default", "wl", "Admitted", corev1.EventTypeNormal).Obj(),
-			},
-			featureGates: map[featuregate.Feature]bool{
-				features.SchedulerLibraryIntegration: true,
-			},
-		},
-		"SchedulerLibraryIntegration enabled: non-hostname lowest-level TAS excludes unschedulable node": {
-			nodes: []corev1.Node{
-				*testingnode.MakeNode("x1").
-					Label("tas-node", "true").
-					Label(tasRackLabel, "r1").
-					StatusAllocatable(corev1.ResourceList{
-						corev1.ResourceCPU:  resource.MustParse("1"),
-						corev1.ResourcePods: resource.MustParse("10"),
-					}).
-					Ready().
-					Obj(),
-				*testingnode.MakeNode("x2").
-					Label("tas-node", "true").
-					Label(tasRackLabel, "r2").
-					StatusAllocatable(corev1.ResourceList{
-						corev1.ResourceCPU:  resource.MustParse("1"),
-						corev1.ResourcePods: resource.MustParse("10"),
-					}).
-					Unschedulable().
-					Ready().
-					Obj(),
-			},
-			topologies: []kueue.Topology{
-				*utiltestingapi.MakeTopology("tas-rack-only").
-					Levels(tasRackLabel).
-					Obj(),
-			},
-			resourceFlavors: []kueue.ResourceFlavor{
-				*utiltestingapi.MakeResourceFlavor("tas-rack-flavor").
-					NodeLabel("tas-node", "true").
-					TopologyName("tas-rack-only").
-					Obj(),
-			},
-			clusterQueues: []kueue.ClusterQueue{
-				*utiltestingapi.MakeClusterQueue("tas-main").
-					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-rack-flavor").
-						Resource(corev1.ResourceCPU, "50").Obj()).
-					Obj(),
-			},
-			workloads: []kueue.Workload{
-				*utiltestingapi.MakeWorkload("wl-rack", "default").
-					Queue("tas-main").
-					PodSets(*utiltestingapi.MakePodSet("main", 1).
-						RequiredTopologyRequest(tasRackLabel).
-						Request(corev1.ResourceCPU, "1").
-						Obj()).
-					Obj(),
-			},
-			wantNewAssignments: map[workload.Reference]kueue.Admission{
-				"default/wl-rack": *utiltestingapi.MakeAdmission("tas-main").
-					PodSets(utiltestingapi.MakePodSetAssignment("main").
-						Assignment(corev1.ResourceCPU, "tas-rack-flavor", "1").
-						TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{tasRackLabel}).
-							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"r1"}, 1).Obj()).
-							Obj()).
-						Obj()).
-					Obj(),
-			},
-			eventCmpOpts: cmp.Options{eventIgnoreMessage},
-			wantEvents: []utiltesting.EventRecord{
-				utiltesting.MakeEventRecord("default", "wl-rack", "QuotaReserved", corev1.EventTypeNormal).Obj(),
-				utiltesting.MakeEventRecord("default", "wl-rack", "Admitted", corev1.EventTypeNormal).Obj(),
-			},
-			featureGates: map[featuregate.Feature]bool{
-				features.SchedulerLibraryIntegration: true,
-			},
-		},
-		"SchedulerLibraryIntegration enabled: hostname lowest-level TAS filters unschedulable node via WAS": {
-			nodes: []corev1.Node{
-				*testingnode.MakeNode("x1").
-					Label("tas-node", "true").
-					Label(corev1.LabelHostname, "x1").
-					StatusAllocatable(corev1.ResourceList{
-						corev1.ResourceCPU:  resource.MustParse("1"),
-						corev1.ResourcePods: resource.MustParse("10"),
-					}).
-					Unschedulable().
-					Ready().
-					Obj(),
-				*testingnode.MakeNode("x2").
-					Label("tas-node", "true").
-					Label(corev1.LabelHostname, "x2").
-					StatusAllocatable(corev1.ResourceList{
-						corev1.ResourceCPU:  resource.MustParse("1"),
-						corev1.ResourcePods: resource.MustParse("10"),
-					}).
-					Ready().
-					Obj(),
-			},
-			topologies:      []kueue.Topology{defaultSingleLevelTopology},
-			resourceFlavors: []kueue.ResourceFlavor{defaultTASFlavor},
-			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueue},
-			workloads: []kueue.Workload{
-				*utiltestingapi.MakeWorkload("wl-hostname", "default").
-					Queue("tas-main").
-					PodSets(*utiltestingapi.MakePodSet("main", 1).
-						RequiredTopologyRequest(corev1.LabelHostname).
-						Request(corev1.ResourceCPU, "1").
-						Obj()).
-					Obj(),
-			},
-			wantNewAssignments: map[workload.Reference]kueue.Admission{
-				"default/wl-hostname": *utiltestingapi.MakeAdmission("tas-main").
-					PodSets(utiltestingapi.MakePodSetAssignment("main").
-						Assignment(corev1.ResourceCPU, "tas-default", "1").
-						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
-							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj()).
-							Obj()).
-						Obj()).
-					Obj(),
-			},
-			eventCmpOpts: cmp.Options{eventIgnoreMessage},
-			wantEvents: []utiltesting.EventRecord{
-				utiltesting.MakeEventRecord("default", "wl-hostname", "QuotaReserved", corev1.EventTypeNormal).Obj(),
-				utiltesting.MakeEventRecord("default", "wl-hostname", "Admitted", corev1.EventTypeNormal).Obj(),
-			},
-			featureGates: map[featuregate.Feature]bool{
-				features.SchedulerLibraryIntegration: true,
-			},
-		},
 	}
-	scenarios := []map[featuregate.Feature]bool{
-		{
-			features.WorkloadRequestUseMergePatch:     false,
-			features.UnadmittedWorkloadsObservability: false,
-			features.TASCacheNodeMatchResults:         true,
-			features.TASCachingRemainingResources:     true,
-		},
-		{
-			features.WorkloadRequestUseMergePatch:     false,
-			features.UnadmittedWorkloadsObservability: true,
-			features.TASCacheNodeMatchResults:         true,
-			features.TASCachingRemainingResources:     true,
-		},
-		{
-			features.WorkloadRequestUseMergePatch:     true,
-			features.UnadmittedWorkloadsObservability: false,
-			features.TASCacheNodeMatchResults:         true,
-			features.TASCachingRemainingResources:     true,
-		},
-		{
-			features.WorkloadRequestUseMergePatch:     true,
-			features.UnadmittedWorkloadsObservability: true,
-			features.TASCacheNodeMatchResults:         true,
-			features.TASCachingRemainingResources:     true,
-		},
-		{
-			features.WorkloadRequestUseMergePatch:     false,
-			features.UnadmittedWorkloadsObservability: false,
-			features.TASCacheNodeMatchResults:         false,
-			features.TASCachingRemainingResources:     false,
-		},
-	}
-
-	for name, tc := range cases {
-		for _, scenario := range scenarios {
-			t.Run(
-				fmt.Sprintf("%s WorkloadRequestUseMergePatch:%t observability:%t cacheMatchResults:%t cachingRemainingResources:%t",
-					name,
-					scenario[features.WorkloadRequestUseMergePatch],
-					scenario[features.UnadmittedWorkloadsObservability],
-					scenario[features.TASCacheNodeMatchResults],
-					scenario[features.TASCachingRemainingResources],
-				),
-				func(t *testing.T) {
-					features.SetFeatureGatesDuringTest(t, scenario)
-					features.SetFeatureGatesDuringTest(t, tc.featureGates)
-					ctx, log := utiltesting.ContextWithLog(t)
-					testWls := make([]kueue.Workload, 0, len(tc.workloads))
-					for _, wl := range tc.workloads {
-						testWls = append(testWls, *wl.DeepCopy())
-					}
-
-					clientBuilder := utiltesting.NewClientBuilder().
-						WithLists(
-							&kueue.AdmissionCheckList{Items: tc.admissionChecks},
-							&kueue.WorkloadList{Items: testWls},
-							&kueue.TopologyList{Items: tc.topologies},
-							&corev1.PodList{Items: tc.pods},
-							&corev1.NodeList{Items: tc.nodes},
-							&kueue.LocalQueueList{Items: queues}).
-						WithObjects(utiltesting.MakeNamespace("default")).
-						WithInterceptorFuncs(interceptor.Funcs{
-							SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
-								if tc.patchStatusErr != nil {
-									return tc.patchStatusErr
-								}
-								return utiltesting.TreatSSAAsStrategicMerge(ctx, c, subResourceName, obj, patch, opts...)
-							},
-						}).
-						WithStatusSubresource(&kueue.Workload{}, &kueue.ClusterQueue{}, &kueue.LocalQueue{})
-
-					for _, ac := range tc.admissionChecks {
-						clientBuilder = clientBuilder.WithStatusSubresource(ac.DeepCopy())
-					}
-					_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
-					cl := clientBuilder.Build()
-					recorder := &utiltesting.EventRecorder{}
-					cacheOptions := []schdcache.Option{schdcache.WithResourceTransformations(tc.resourceTransformations)}
-					if features.Enabled(features.SchedulerLibraryIntegration) {
-						sim, err := was.NewWASSimulator(klog.NewContext(ctx, logr.Discard()), nil)
-						if err != nil {
-							t.Fatalf("Failed to initialize WAS scheduling simulator: %v", err)
-						}
-						cacheOptions = append(cacheOptions, schdcache.WithSchedulingSimulator(sim))
-					}
-					cqCache := schdcache.New(cl, cacheOptions...)
-					fakeClock := testingclock.NewFakeClock(now)
-					qManager := qcache.NewManagerForUnitTests(cl, cqCache,
-						qcache.WithClock(fakeClock), qcache.WithResourceTransformations(tc.resourceTransformations))
-					topologyByName := slices.ToMap(tc.topologies, func(i int) (kueue.TopologyReference, kueue.Topology) {
-						return kueue.TopologyReference(tc.topologies[i].Name), tc.topologies[i]
-					})
-					for i := range tc.nodes {
-						cqCache.TASCache().SyncNode(&tc.nodes[i])
-					}
-					for _, ac := range tc.admissionChecks {
-						cqCache.AddOrUpdateAdmissionCheck(log, &ac)
-					}
-					for _, flavor := range tc.resourceFlavors {
-						cqCache.AddOrUpdateResourceFlavor(log, &flavor)
-						if flavor.Spec.TopologyName != nil {
-							t := topologyByName[*flavor.Spec.TopologyName]
-							cqCache.AddOrUpdateTopology(log, &t)
-						}
-					}
-					for _, cq := range tc.clusterQueues {
-						if err := cqCache.AddClusterQueue(ctx, &cq); err != nil {
-							t.Fatalf("Inserting clusterQueue %s in cache: %v", cq.Name, err)
-						}
-						if err := qManager.AddClusterQueue(ctx, &cq); err != nil {
-							t.Fatalf("Inserting clusterQueue %s in manager: %v", cq.Name, err)
-						}
-						if err := cl.Create(ctx, &cq); err != nil {
-							t.Fatalf("couldn't create the cluster queue: %v", err)
-						}
-					}
-					for _, q := range queues {
-						if err := qManager.AddLocalQueue(ctx, &q); err != nil {
-							t.Fatalf("Inserting queue %s/%s in manager: %v", q.Namespace, q.Name, err)
-						}
-					}
-					for _, pod := range tc.pods {
-						cqCache.TASCache().UpdateNonTASUsage(&pod, log)
-					}
-					initiallyAdmittedWorkloads := sets.New[workload.Reference]()
-					for _, w := range testWls {
-						if workload.IsAdmitted(&w) && !workload.HasUnhealthyNodes(&w) {
-							initiallyAdmittedWorkloads.Insert(workload.Key(&w))
-						}
-					}
-					// Reserved workloads must contribute their usage to the snapshot, mirroring production.
-					for i := range testWls {
-						if workload.HasQuotaReservation(&testWls[i]) {
-							cqCache.AddOrUpdateWorkload(log, &testWls[i])
-						}
-					}
-					for _, w := range testWls {
-						if qManager.QueueSecondPassIfNeeded(ctx, &w, 0) {
-							fakeClock.Step(time.Second)
-						}
-					}
-					scheduler := New(qManager, cqCache, cl, recorder, WithPreemptionExpectations(preemptexpectations.New()))
-					wg := sync.WaitGroup{}
-					scheduler.setAdmissionRoutineWrapper(routine.NewWrapper(
-						func() { wg.Add(1) },
-						func() { wg.Done() },
-					))
-
-					ctx, cancel := context.WithTimeout(ctx, queueingTimeout)
-					go qManager.CleanUpOnContext(ctx)
-					defer cancel()
-
-					scheduler.schedule(ctx)
-					wg.Wait()
-					snapshot, err := cqCache.Snapshot(ctx)
-					if err != nil {
-						t.Fatalf("unexpected error while building snapshot: %v", err)
-					}
-					gotAssignments := make(map[workload.Reference]kueue.Admission)
-					for cqName, c := range snapshot.ClusterQueues() {
-						for name, w := range c.Workloads {
-							if initiallyAdmittedWorkloads.Has(workload.Key(w.Obj)) {
-								continue
-							}
-							switch {
-							case !workload.HasQuotaReservation(w.Obj):
-								t.Fatalf("Workload %s is not admitted by a clusterQueue, but it is found as member of clusterQueue %s in the cache", name, cqName)
-							case w.Obj.Status.Admission.ClusterQueue != cqName:
-								t.Fatalf("Workload %s is admitted by clusterQueue %s, but it is found as member of clusterQueue %s in the cache", name, w.Obj.Status.Admission.ClusterQueue, cqName)
-							default:
-								gotAssignments[name] = *w.Obj.Status.Admission
-							}
-						}
-					}
-					if diff := cmp.Diff(tc.wantNewAssignments, gotAssignments, cmpopts.EquateEmpty()); diff != "" {
-						t.Errorf("Unexpected assigned clusterQueues in cache (-want,+got):\n%s", diff)
-					}
-					qDump := qManager.Dump()
-					if diff := cmp.Diff(tc.wantLeft, qDump, cmpDump...); diff != "" {
-						t.Errorf("Unexpected elements left in the queue (-want,+got):\n%s", diff)
-					}
-					qDumpInadmissible := qManager.DumpInadmissible()
-					if diff := cmp.Diff(tc.wantInadmissibleLeft, qDumpInadmissible, cmpDump...); diff != "" {
-						t.Errorf("Unexpected elements left in inadmissible workloads (-want,+got):\n%s", diff)
-					}
-					var wantEvents []utiltesting.EventRecord
-					if tc.wantEvents != nil {
-						wantEvents = make([]utiltesting.EventRecord, len(tc.wantEvents))
-						copy(wantEvents, tc.wantEvents)
-						if !scenario[features.UnadmittedWorkloadsObservability] {
-							utiltesting.AdjustEventsForDisabledObservabilityInScheduler(wantEvents)
-						}
-					}
-					if diff := cmp.Diff(wantEvents, recorder.RecordedEvents, tc.eventCmpOpts...); diff != "" {
-						t.Errorf("unexpected events (-want/+got):\n%s", diff)
-					}
-				},
-			)
-		}
-	}
+	runScheduleForTASCases(t, queues, now, cases)
 }
 
 // tasScheduleTestCase is the shared case definition for the TAS preemption and cohort
@@ -4049,8 +5295,25 @@ type tasScheduleTestCase struct {
 	cohorts         []kueue.Cohort
 	resourceFlavors []kueue.ResourceFlavor
 	clusterQueues   []kueue.ClusterQueue
+	admissionChecks []kueue.AdmissionCheck
 	workloads       []kueue.Workload
 	wantWorkloads   []kueue.Workload
+
+	featureGates map[featuregate.Feature]bool
+
+	// simulatorOverride allows to set a custom simulator.SchedulerSimulator.
+	simulatorOverride func() simulator.SchedulerSimulator
+
+	// prequeuedSecondPasses are the Workloads with a second pass already pending when the cycle runs.
+	prequeuedSecondPasses []workload.Reference
+
+	// recoveryTimeout bounds failed TAS replacement deferral in this case.
+	// A nil value keeps the default used by normal Kueue configuration.
+	recoveryTimeout *time.Duration
+
+	// wantWorkloadsAfterSecondSchedule, when set, is the Workloads after one more cycle,
+	// in which the pending second passes run.
+	wantWorkloadsAfterSecondSchedule []kueue.Workload
 
 	// wantNewAssignments is a summary of all new admissions in the cache after this cycle.
 	wantNewAssignments map[workload.Reference]kueue.Admission
@@ -4063,11 +5326,93 @@ type tasScheduleTestCase struct {
 	// eventCmpOpts are the comparison options for the events
 	eventCmpOpts cmp.Options
 
-	featureGates map[featuregate.Feature]bool
+	// wantSimulatorPreemptions are the Workloads the scheduler must tell the
+	// simulator to preempt.
+	wantSimulatorPreemptions []workload.Reference
+
+	// failSimulatorPreemption makes that simulator refuse to release Workloads.
+	failSimulatorPreemption bool
+
+	// wantSimulatorReleasedTogether are the Workloads that must be out of the simulator
+	// at the same moment feasibility runs. A call count cannot tell that apart from a
+	// release that happened afterwards.
+	wantSimulatorReleasedTogether []workload.Reference
+}
+
+type simulatorFactoryOverride struct {
+	simulator.Factory
+	simulatorOverride simulator.SchedulerSimulator
+}
+
+func (sfo *simulatorFactoryOverride) NewSimulator(_ context.Context, _ []*corev1.Node, _ *podtracker.Tracker, _ ...simulator.Option) (simulator.SchedulerSimulator, error) {
+	return sfo.simulatorOverride, nil
 }
 
 // tasScheduleTestConfig carries the per-suite fixtures shared by the TAS preemption
 // and cohort scheduling run procedure.
+// recordingSimulatorFactory records which Workloads the scheduler asked the simulator to
+// preempt, and delegates everything else to the real one so feasibility is not a
+// stand-in.
+type recordingSimulatorFactory struct {
+	simulatorFactory simulator.Factory
+	recorder         recordingSchedulerSimulator
+}
+
+func (s *recordingSimulatorFactory) NewSimulator(ctx context.Context, nodes []*corev1.Node, pods *podtracker.Tracker, options ...simulator.Option) (simulator.SchedulerSimulator, error) {
+	schedulerSimulator, err := s.simulatorFactory.NewSimulator(ctx, nodes, pods, options...)
+	if err != nil {
+		return nil, err
+	}
+	s.recorder.SchedulerSimulator = schedulerSimulator
+	s.recorder.releasedNow = sets.New[workload.Reference]()
+	return &s.recorder, nil
+}
+
+type recordingSchedulerSimulator struct {
+	simulator.SchedulerSimulator
+	// failPreempt makes PreemptWorkload return an error.
+	failPreempt bool
+	// asked holds every Workload the scheduler tried to release, released holds the
+	// ones it managed to. They differ when failPreempt is set.
+	asked            []workload.Reference
+	released         int
+	reverted         int
+	releasedNow      sets.Set[workload.Reference]
+	releasedTogether sets.Set[workload.Reference]
+}
+
+func (s *recordingSchedulerSimulator) PreemptWorkload(ctx context.Context, wlKey workload.Reference) (func() error, error) {
+	s.asked = append(s.asked, wlKey)
+	if s.failPreempt {
+		return nil, errors.New("simulated failure")
+	}
+	revert, err := s.SchedulerSimulator.PreemptWorkload(ctx, wlKey)
+	if err != nil {
+		return nil, err
+	}
+	s.released++
+	s.releasedNow.Insert(wlKey)
+	return func() error {
+		s.reverted++
+		s.releasedNow.Delete(wlKey)
+		return revert()
+	}, nil
+}
+
+func (s *recordingSchedulerSimulator) FindFeasibleNodes(
+	ctx context.Context,
+	candidates iter.Seq[simulator.Candidate],
+	requirements *simulator.PodRequirements,
+	stats *simulator.NodeExclusionStats,
+) ([]simulator.MatchedCandidate, error) {
+	// Feasibility is the moment that matters, so what is released is recorded here
+	// rather than when the scheduler asks.
+	if s.releasedNow.Len() > s.releasedTogether.Len() {
+		s.releasedTogether = s.releasedNow.Clone()
+	}
+	return s.SchedulerSimulator.FindFeasibleNodes(ctx, candidates, requirements, stats)
+}
+
 type tasScheduleTestConfig struct {
 	queues []kueue.LocalQueue
 	now    time.Time
@@ -4136,19 +5481,30 @@ func runTASScheduleTestCases(t *testing.T, cfg tasScheduleTestConfig, cases map[
 					scenario[features.VectorizedResourceRequests],
 				),
 				func(t *testing.T) {
+					// The recording simulator is installed only when the case enables
+					// SchedulerLibraryIntegration, so simulator expectations set without
+					// the gate would never be checked.
+					hasSimulatorExpectations := tc.failSimulatorPreemption || tc.wantSimulatorPreemptions != nil || tc.wantSimulatorReleasedTogether != nil
+					if hasSimulatorExpectations && !tc.featureGates[features.SchedulerLibraryIntegration] {
+						t.Fatal("simulator expectations are set, but SchedulerLibraryIntegration is not enabled in featureGates")
+					}
 					features.SetFeatureGatesDuringTest(t, scenario)
 					features.SetFeatureGatesDuringTest(t, tc.featureGates)
 
-					var wantWorkloads []kueue.Workload
-					if tc.wantWorkloads != nil {
-						wantWorkloads = make([]kueue.Workload, len(tc.wantWorkloads))
-						for i := range tc.wantWorkloads {
-							wantWorkloads[i] = *tc.wantWorkloads[i].DeepCopy()
+					adjustWantWorkloads := func(want []kueue.Workload) []kueue.Workload {
+						if want == nil {
+							return nil
+						}
+						adjusted := make([]kueue.Workload, len(want))
+						for i := range want {
+							adjusted[i] = *want[i].DeepCopy()
 						}
 						if !scenario[features.UnadmittedWorkloadsObservability] {
-							utiltesting.AdjustWorkloadsForDisabledObservabilityInScheduler(wantWorkloads)
+							utiltesting.AdjustWorkloadsForDisabledObservabilityInScheduler(adjusted)
 						}
+						return adjusted
 					}
+					wantWorkloads := adjustWantWorkloads(tc.wantWorkloads)
 
 					ctx, log := utiltesting.ContextWithLog(t)
 					testWls := make([]kueue.Workload, 0, len(tc.workloads))
@@ -4165,24 +5521,51 @@ func runTASScheduleTestCases(t *testing.T, cfg tasScheduleTestConfig, cases map[
 						WithObjects(
 							utiltesting.MakeNamespace("default"),
 						).
-						WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge}).
+						WithInterceptorFuncs(interceptor.Funcs{
+							SubResourceApply: utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration,
+						}).
 						WithStatusSubresource(&kueue.Workload{})
 					_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
 					cl := clientBuilder.Build()
 					recorder := &utiltesting.EventRecorder{}
-					cqCache := schdcache.New(cl)
-					qManager := qcache.NewManagerForUnitTests(cl, cqCache)
+					var recordingFactory *recordingSimulatorFactory
+					cacheOptions := []schdcache.Option{}
+					if tc.featureGates[features.SchedulerLibraryIntegration] {
+						var simulatorFactory simulator.Factory
+						var err error
+						simulatorFactory, err = was.NewWASSimulatorFactory(klog.NewContext(ctx, logr.Discard()), nil)
+						if err != nil {
+							t.Fatalf("Failed to initialize WAS scheduling simulator: %v", err)
+						}
+						if tc.simulatorOverride != nil {
+							simulatorFactory = &simulatorFactoryOverride{
+								Factory:           simulatorFactory,
+								simulatorOverride: tc.simulatorOverride(),
+							}
+						}
+						recordingFactory = &recordingSimulatorFactory{simulatorFactory: simulatorFactory}
+						recordingFactory.recorder.failPreempt = tc.failSimulatorPreemption
+						cacheOptions = append(cacheOptions, schdcache.WithSimulatorFactory(recordingFactory))
+					}
+					cqCache := schdcache.New(cl, cacheOptions...)
+					fakeClock := testingclock.NewFakeClock(cfg.now)
+					qManager := qcache.NewManagerForUnitTests(cl, cqCache, qcache.WithClock(fakeClock))
 					topologyByName := slices.ToMap(tc.topologies, func(i int) (kueue.TopologyReference, kueue.Topology) {
 						return kueue.TopologyReference(tc.topologies[i].Name), tc.topologies[i]
 					})
 					for i := range tc.nodes {
 						cqCache.TASCache().SyncNode(&tc.nodes[i])
 					}
+					for i := range tc.pods {
+						cqCache.TrackPod(ctx, &tc.pods[i])
+					}
+					for i := range tc.admissionChecks {
+						cqCache.AddOrUpdateAdmissionCheck(log, &tc.admissionChecks[i])
+					}
 					for _, flavor := range tc.resourceFlavors {
 						cqCache.AddOrUpdateResourceFlavor(log, &flavor)
 						if flavor.Spec.TopologyName != nil {
-							t := topologyByName[*flavor.Spec.TopologyName]
-							cqCache.AddOrUpdateTopology(log, &t)
+							cqCache.AddOrUpdateTopology(log, new(topologyByName[*flavor.Spec.TopologyName]))
 						}
 					}
 					for _, cohort := range tc.cohorts {
@@ -4206,13 +5589,35 @@ func runTASScheduleTestCases(t *testing.T, cfg tasScheduleTestConfig, cases map[
 							t.Fatalf("Inserting queue %s/%s in manager: %v", q.Namespace, q.Name, err)
 						}
 					}
-					initiallyAdmittedWorkloads := sets.New[workload.Reference]()
+					initiallyReservedWorkloads := sets.New[workload.Reference]()
 					for _, w := range testWls {
-						if workload.IsAdmitted(&w) {
-							initiallyAdmittedWorkloads.Insert(workload.Key(&w))
+						if workload.HasQuotaReservation(&w) {
+							initiallyReservedWorkloads.Insert(workload.Key(&w))
 						}
 					}
-					scheduler := New(qManager, cqCache, cl, recorder, WithClock(t, testingclock.NewFakeClock(cfg.now)), WithPreemptionExpectations(preemptexpectations.New()))
+					prequeued := sets.New(tc.prequeuedSecondPasses...)
+					for i := range testWls {
+						wl := &testWls[i]
+						if !prequeued.Has(workload.Key(wl)) {
+							continue
+						}
+						if !qManager.QueueSecondPassIfNeeded(ctx, wl, 0) {
+							t.Fatalf("expected workload %s to be queued for a second pass", workload.Key(wl))
+						}
+						fakeClock.Step(time.Second)
+						if !qManager.QueueSecondPassIfNeeded(ctx, wl, 0) {
+							t.Fatalf("expected workload %s to be prequeued again for a second pass", workload.Key(wl))
+						}
+					}
+					recoveryTimeout := 30 * time.Minute
+					if tc.recoveryTimeout != nil {
+						recoveryTimeout = *tc.recoveryTimeout
+					}
+					schedulerOpts := []Option{WithClock(t, fakeClock), WithPreemptionExpectations(preemptexpectations.New())}
+					if recoveryTimeout > 0 {
+						schedulerOpts = append(schedulerOpts, WithFailedTASReplacementRecoveryTimeout(new(recoveryTimeout)))
+					}
+					scheduler := New(qManager, cqCache, cl, recorder, schedulerOpts...)
 					wg := sync.WaitGroup{}
 					scheduler.setAdmissionRoutineWrapper(routine.NewWrapper(
 						func() { wg.Add(1) },
@@ -4251,7 +5656,7 @@ func runTASScheduleTestCases(t *testing.T, cfg tasScheduleTestConfig, cases map[
 					gotAssignments := make(map[workload.Reference]kueue.Admission)
 					for cqName, c := range snapshot.ClusterQueues() {
 						for name, w := range c.Workloads {
-							if initiallyAdmittedWorkloads.Has(workload.Key(w.Obj)) {
+							if initiallyReservedWorkloads.Has(workload.Key(w.Obj)) {
 								continue
 							}
 							switch {
@@ -4272,8 +5677,36 @@ func runTASScheduleTestCases(t *testing.T, cfg tasScheduleTestConfig, cases map[
 						t.Errorf("Unexpected elements left in the queue (-want,+got):\n%s", diff)
 					}
 					qDumpInadmissible := qManager.DumpInadmissible()
+					if recordingFactory != nil {
+						sortRefs := cmpopts.SortSlices(func(a, b workload.Reference) bool { return a < b })
+						gotPreemptions := recordingFactory.recorder.asked
+						if diff := cmp.Diff(tc.wantSimulatorPreemptions, gotPreemptions, cmpopts.EquateEmpty(), sortRefs); diff != "" {
+							t.Errorf("unexpected preemptions reported to the simulator (-want/+got):\n%s", diff)
+						}
+						if got, want := recordingFactory.recorder.reverted, recordingFactory.recorder.released; got != want {
+							t.Errorf("simulator preemptions reverted = %d, want %d: the simulated cluster must be restored", got, want)
+						}
+						if tc.wantSimulatorReleasedTogether != nil {
+							gotTogether := sets.List(recordingFactory.recorder.releasedTogether)
+							if diff := cmp.Diff(tc.wantSimulatorReleasedTogether, gotTogether, cmpopts.EquateEmpty()); diff != "" {
+								t.Errorf("unexpected Workloads released from the simulator at once while feasibility was computed (-want/+got):\n%s", diff)
+							}
+						}
+					}
 					if diff := cmp.Diff(tc.wantInadmissibleLeft, qDumpInadmissible, cmpDump...); diff != "" {
 						t.Errorf("Unexpected elements left in inadmissible workloads (-want,+got):\n%s", diff)
+					}
+					if tc.wantWorkloadsAfterSecondSchedule != nil {
+						fakeClock.Step(time.Second)
+						scheduler.schedule(ctx)
+						wg.Wait()
+						gotWorkloads := &kueue.WorkloadList{}
+						if err := cl.List(ctx, gotWorkloads); err != nil {
+							t.Fatalf("Unexpected list workloads error: %v", err)
+						}
+						if diff := cmp.Diff(adjustWantWorkloads(tc.wantWorkloadsAfterSecondSchedule), gotWorkloads.Items, defaultWorkloadCmpOpts); diff != "" {
+							t.Errorf("Unexpected workloads after the second schedule (-want,+got):\n%s", diff)
+						}
 					}
 					var wantEvents []utiltesting.EventRecord
 					if tc.wantEvents != nil {
@@ -4483,6 +5916,365 @@ func TestScheduleForTASPreemption(t *testing.T) {
 					Obj(),
 			},
 		},
+		"preemption with a PodSet group whose members are not adjacent": {
+			// The assignment lists leader and worker together, so its PodSet order differs from the Workload's.
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label("tas-node", "true").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("50"),
+						corev1.ResourceMemory: resource.MustParse("50Gi"),
+						corev1.ResourcePods:   resource.MustParse("50"),
+					}).
+					Ready().
+					Obj(),
+			},
+			topologies:      []kueue.Topology{defaultSingleLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASFlavor},
+			clusterQueues: []kueue.ClusterQueue{
+				*utiltestingapi.MakeClusterQueue("tas-main").
+					Preemption(kueue.ClusterQueuePreemption{WithinClusterQueue: kueue.PreemptionPolicyLowerPriority}).
+					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").
+						Resource(corev1.ResourceCPU, "4").
+						Resource(corev1.ResourceMemory, "10Gi").Obj()).
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					UID("wl-foo").
+					JobUID("job-foo").
+					Queue("tas-main").
+					Priority(1).
+					PodSets(
+						*utiltestingapi.MakePodSet("leader", 1).
+							RequiredTopologyRequest(corev1.LabelHostname).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltestingapi.MakePodSet("other", 2).
+							RequiredTopologyRequest(corev1.LabelHostname).
+							Request(corev1.ResourceCPU, "1").
+							Request(corev1.ResourceMemory, "1Gi").
+							Obj(),
+						*utiltestingapi.MakePodSet("worker", 1).
+							RequiredTopologyRequest(corev1.LabelHostname).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					Obj(),
+				*utiltestingapi.MakeWorkload("low", "default").
+					Queue("tas-main").
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "4").
+								Count(4).
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 4).Obj()).
+									Obj()).
+								Obj()).
+							Obj(),
+						now,
+					).
+					AdmittedAt(true, now).
+					PodSets(*utiltestingapi.MakePodSet("one", 4).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					UID("wl-foo").
+					JobUID("job-foo").
+					Queue("tas-main").
+					Priority(1).
+					PodSets(
+						*utiltestingapi.MakePodSet("leader", 1).
+							RequiredTopologyRequest(corev1.LabelHostname).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltestingapi.MakePodSet("other", 2).
+							RequiredTopologyRequest(corev1.LabelHostname).
+							Request(corev1.ResourceCPU, "1").
+							Request(corev1.ResourceMemory, "1Gi").
+							Obj(),
+						*utiltestingapi.MakePodSet("worker", 1).
+							RequiredTopologyRequest(corev1.LabelHostname).
+							PodSetGroup("g").
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadQuotaReserved,
+						Status:             metav1.ConditionFalse,
+						Reason:             kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads,
+						Message:            "couldn't assign flavors to pod set leader: insufficient unused quota for cpu in flavor tas-default, 2 more needed; couldn't assign flavors to pod set worker: insufficient unused quota for cpu in flavor tas-default, 2 more needed; couldn't assign flavors to pod set other: insufficient unused quota for cpu in flavor tas-default, 4 more needed. Pending the preemption of 1 workload(s)",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadAdmitted,
+						Status:             metav1.ConditionFalse,
+						Reason:             kueue.WorkloadAdmittedReasonNoReservation,
+						Message:            "The workload has no reservation",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					ResourceRequests(
+						kueue.PodSetRequest{Name: "leader", Resources: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}},
+						kueue.PodSetRequest{Name: "other", Resources: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("2"),
+							corev1.ResourceMemory: resource.MustParse("2Gi"),
+						}},
+						kueue.PodSetRequest{Name: "worker", Resources: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}},
+					).
+					Obj(),
+				*utiltestingapi.MakeWorkload("low", "default").
+					Queue("tas-main").
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "4").
+								Count(4).
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 4).Obj()).
+									Obj()).
+								Obj()).
+							Obj(),
+						now,
+					).
+					AdmittedAt(true, now).
+					PodSets(*utiltestingapi.MakePodSet("one", 4).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadEvicted,
+						Status:             metav1.ConditionTrue,
+						Reason:             "Preempted",
+						Message:            "Preempted to accommodate a workload (UID: wl-foo, JobUID: job-foo) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadPreempted,
+						Status:             metav1.ConditionTrue,
+						Reason:             "InClusterQueue",
+						Message:            "Preempted to accommodate a workload (UID: wl-foo, JobUID: job-foo) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					SchedulingStatsEviction(kueue.WorkloadSchedulingStatsEviction{Reason: "Preempted", Count: 1}).
+					Obj(),
+			},
+			wantLeft: map[kueue.ClusterQueueReference][]workload.Reference{
+				"tas-main": {"default/foo"},
+			},
+			eventCmpOpts: cmp.Options{eventIgnoreMessage},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "low", "EvictedDueToPreempted", "Normal").Obj(),
+				utiltesting.MakeEventRecord("default", "low", "Preempted", "Normal").Obj(),
+				utiltesting.MakeEventRecord("default", "foo", "PreemptedWorkload", "Normal").Obj(),
+				utiltesting.MakeEventRecord("default", "foo", kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads, "Warning").Obj(),
+			},
+		},
+		"preemption frees enough Pods when the ClusterQueue has pods quota": {
+			// Preempting low-4 alone frees enough room on the node; only the pods
+			// quota needs both to go, so the node must allow more Pods than the quota.
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label("tas-node", "true").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("50"),
+						corev1.ResourceMemory: resource.MustParse("50Gi"),
+						corev1.ResourcePods:   resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			topologies:      []kueue.Topology{defaultSingleLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASFlavor},
+			clusterQueues: []kueue.ClusterQueue{
+				*utiltestingapi.MakeClusterQueue("tas-main").
+					Preemption(kueue.ClusterQueuePreemption{WithinClusterQueue: kueue.PreemptionPolicyLowerPriority}).
+					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").
+						Resource(corev1.ResourceCPU, "50").
+						Resource(corev1.ResourcePods, "7").Obj()).
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					UID("wl-foo").
+					JobUID("job-foo").
+					Queue("tas-main").
+					Priority(1).
+					PodSets(*utiltestingapi.MakePodSet("one", 7).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					Obj(),
+				*utiltestingapi.MakeWorkload("low-4", "default").
+					Queue("tas-main").
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "4").
+								Assignment(corev1.ResourcePods, "tas-default", "4").
+								Count(4).
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 4).Obj()).
+									Obj()).
+								Obj()).
+							Obj(),
+						now,
+					).
+					AdmittedAt(true, now).
+					PodSets(*utiltestingapi.MakePodSet("one", 4).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					Obj(),
+				*utiltestingapi.MakeWorkload("low-3", "default").
+					Queue("tas-main").
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "3").
+								Assignment(corev1.ResourcePods, "tas-default", "3").
+								Count(3).
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 3).Obj()).
+									Obj()).
+								Obj()).
+							Obj(),
+						now,
+					).
+					AdmittedAt(true, now).
+					PodSets(*utiltestingapi.MakePodSet("one", 3).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					UID("wl-foo").
+					JobUID("job-foo").
+					Queue("tas-main").
+					Priority(1).
+					PodSets(*utiltestingapi.MakePodSet("one", 7).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadQuotaReserved,
+						Status:             metav1.ConditionFalse,
+						Reason:             kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads,
+						Message:            "couldn't assign flavors to pod set one: insufficient unused quota for pods in flavor tas-default, 7 more needed. Pending the preemption of 2 workload(s)",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadAdmitted,
+						Status:             metav1.ConditionFalse,
+						Reason:             kueue.WorkloadAdmittedReasonNoReservation,
+						Message:            "The workload has no reservation",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					ResourceRequests(kueue.PodSetRequest{
+						Name: "one",
+						Resources: corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("7"),
+						},
+					}).
+					Obj(),
+				*utiltestingapi.MakeWorkload("low-3", "default").
+					Queue("tas-main").
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "3").
+								Assignment(corev1.ResourcePods, "tas-default", "3").
+								Count(3).
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 3).Obj()).
+									Obj()).
+								Obj()).
+							Obj(),
+						now,
+					).
+					AdmittedAt(true, now).
+					PodSets(*utiltestingapi.MakePodSet("one", 3).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadEvicted,
+						Status:             metav1.ConditionTrue,
+						Reason:             "Preempted",
+						Message:            "Preempted to accommodate a workload (UID: wl-foo, JobUID: job-foo) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadPreempted,
+						Status:             metav1.ConditionTrue,
+						Reason:             "InClusterQueue",
+						Message:            "Preempted to accommodate a workload (UID: wl-foo, JobUID: job-foo) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					SchedulingStatsEviction(kueue.WorkloadSchedulingStatsEviction{Reason: "Preempted", Count: 1}).
+					Obj(),
+				*utiltestingapi.MakeWorkload("low-4", "default").
+					Queue("tas-main").
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "4").
+								Assignment(corev1.ResourcePods, "tas-default", "4").
+								Count(4).
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 4).Obj()).
+									Obj()).
+								Obj()).
+							Obj(),
+						now,
+					).
+					AdmittedAt(true, now).
+					PodSets(*utiltestingapi.MakePodSet("one", 4).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadEvicted,
+						Status:             metav1.ConditionTrue,
+						Reason:             "Preempted",
+						Message:            "Preempted to accommodate a workload (UID: wl-foo, JobUID: job-foo) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadPreempted,
+						Status:             metav1.ConditionTrue,
+						Reason:             "InClusterQueue",
+						Message:            "Preempted to accommodate a workload (UID: wl-foo, JobUID: job-foo) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					SchedulingStatsEviction(kueue.WorkloadSchedulingStatsEviction{Reason: "Preempted", Count: 1}).
+					Obj(),
+			},
+			wantLeft: map[kueue.ClusterQueueReference][]workload.Reference{
+				"tas-main": {"default/foo"},
+			},
+			eventCmpOpts: cmp.Options{eventIgnoreMessage},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "low-4", "EvictedDueToPreempted", "Normal").Obj(),
+				utiltesting.MakeEventRecord("default", "low-4", "Preempted", "Normal").Obj(),
+				utiltesting.MakeEventRecord("default", "foo", "PreemptedWorkload", "Normal").Obj(),
+				utiltesting.MakeEventRecord("default", "low-3", "EvictedDueToPreempted", "Normal").Obj(),
+				utiltesting.MakeEventRecord("default", "low-3", "Preempted", "Normal").Obj(),
+				utiltesting.MakeEventRecord("default", "foo", "PreemptedWorkload", "Normal").Obj(),
+				utiltesting.MakeEventRecord("default", "foo", kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads, "Warning").Obj(),
+			},
+		},
 		// Verifies TAS uses PodSpec memory (4Gi) for preemption fit, not quota-derived values.
 		// Node has 5Gi, incoming workload needs 4Gi, so it must preempt the 2Gi admitted workload.
 		"preemption; TAS uses podspec memory for fit": {
@@ -4613,132 +6405,6 @@ func TestScheduleForTASPreemption(t *testing.T) {
 					Obj(),
 				utiltesting.MakeEventRecord("default", "foo", kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads, "Warning").
 					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" doesn't allow to fit any of 1 pod(s). Total nodes: 1; excluded: resource "memory": 1. Pending the preemption of 1 workload(s)`).
-					Obj(),
-			},
-		},
-		"only low priority workload is preempted": {
-			// This test case demonstrates the baseline scenario where there
-			// is only one low-priority workload and it gets preempted.
-			nodes:           defaultSingleNode,
-			topologies:      []kueue.Topology{defaultSingleLevelTopology},
-			resourceFlavors: []kueue.ResourceFlavor{defaultTASFlavor},
-			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueueWithPreemption},
-			workloads: []kueue.Workload{
-				*utiltestingapi.MakeWorkload("foo", "default").
-					UID("wl-foo").
-					JobUID("job-foo").
-					Queue("tas-main").
-					Priority(3).
-					PodSets(*utiltestingapi.MakePodSet("one", 1).
-						PreferredTopologyRequest(corev1.LabelHostname).
-						Request(corev1.ResourceCPU, "2").
-						Obj()).
-					Obj(),
-				*utiltestingapi.MakeWorkload("low-priority-admitted", "default").
-					UID("low-priority-admitted-uid").
-					Queue("tas-main").
-					Priority(1).
-					ReserveQuotaAt(
-						utiltestingapi.MakeAdmission("tas-main").
-							PodSets(utiltestingapi.MakePodSetAssignment("one").
-								Assignment(corev1.ResourceCPU, "tas-default", "5").
-								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
-									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
-									Obj()).
-								Obj()).
-							Obj(),
-						now,
-					).
-					AdmittedAt(true, now).
-					PodSets(*utiltestingapi.MakePodSet("one", 1).
-						RequiredTopologyRequest(corev1.LabelHostname).
-						Request(corev1.ResourceCPU, "5").
-						Obj()).
-					Obj(),
-			},
-			wantWorkloads: []kueue.Workload{
-				*utiltestingapi.MakeWorkload("foo", "default").
-					UID("wl-foo").
-					JobUID("job-foo").
-					Queue("tas-main").
-					Priority(3).
-					PodSets(*utiltestingapi.MakePodSet("one", 1).
-						PreferredTopologyRequest(corev1.LabelHostname).
-						Request(corev1.ResourceCPU, "2").
-						Obj()).
-					Condition(metav1.Condition{
-						Type:               kueue.WorkloadQuotaReserved,
-						Status:             metav1.ConditionFalse,
-						Reason:             kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads,
-						Message:            `couldn't assign flavors to pod set one: topology "tas-single-level" doesn't allow to fit any of 1 pod(s). Total nodes: 1; excluded: resource "cpu": 1. Pending the preemption of 1 workload(s)`,
-						LastTransitionTime: metav1.NewTime(now),
-					}).
-					Condition(metav1.Condition{
-						Type:               kueue.WorkloadAdmitted,
-						Status:             metav1.ConditionFalse,
-						Reason:             kueue.WorkloadAdmittedReasonNoReservation,
-						Message:            "The workload has no reservation",
-						LastTransitionTime: metav1.NewTime(now),
-					}).
-					ResourceRequests(kueue.PodSetRequest{
-						Name: "one",
-						Resources: corev1.ResourceList{
-							corev1.ResourceCPU: resource.MustParse("2"),
-						},
-					}).
-					Obj(),
-				*utiltestingapi.MakeWorkload("low-priority-admitted", "default").
-					UID("low-priority-admitted-uid").
-					Queue("tas-main").
-					Priority(1).
-					ReserveQuotaAt(
-						utiltestingapi.MakeAdmission("tas-main").
-							PodSets(utiltestingapi.MakePodSetAssignment("one").
-								Assignment(corev1.ResourceCPU, "tas-default", "5").
-								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
-									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
-									Obj()).
-								Obj()).
-							Obj(),
-						now,
-					).
-					AdmittedAt(true, now).
-					PodSets(*utiltestingapi.MakePodSet("one", 1).
-						RequiredTopologyRequest(corev1.LabelHostname).
-						Request(corev1.ResourceCPU, "5").
-						Obj()).
-					Condition(metav1.Condition{
-						Type:               kueue.WorkloadEvicted,
-						Status:             metav1.ConditionTrue,
-						Reason:             "Preempted",
-						Message:            "Preempted to accommodate a workload (UID: wl-foo, JobUID: job-foo) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main",
-						LastTransitionTime: metav1.NewTime(now),
-					}).
-					Condition(metav1.Condition{
-						Type:               kueue.WorkloadPreempted,
-						Status:             metav1.ConditionTrue,
-						Reason:             "InClusterQueue",
-						Message:            "Preempted to accommodate a workload (UID: wl-foo, JobUID: job-foo) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main",
-						LastTransitionTime: metav1.NewTime(now),
-					}).
-					SchedulingStatsEviction(kueue.WorkloadSchedulingStatsEviction{Reason: "Preempted", Count: 1}).
-					Obj(),
-			},
-			wantLeft: map[kueue.ClusterQueueReference][]workload.Reference{
-				"tas-main": {"default/foo"},
-			},
-			wantEvents: []utiltesting.EventRecord{
-				utiltesting.MakeEventRecord("default", "low-priority-admitted", "EvictedDueToPreempted", "Normal").
-					Message("Preempted to accommodate a workload (UID: wl-foo, JobUID: job-foo) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main").
-					Obj(),
-				utiltesting.MakeEventRecord("default", "low-priority-admitted", "Preempted", "Normal").
-					Message("Preempted to accommodate a workload (UID: wl-foo, JobUID: job-foo) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main; preemptor effective priority: 3 (base: 3, boost: 0); preemptee effective priority: 1 (base: 1, boost: 0)").
-					Obj(),
-				utiltesting.MakeEventRecord("default", "foo", "PreemptedWorkload", "Normal").
-					Message("Preempted workload default/low-priority-admitted (UID: low-priority-admitted-uid) in ClusterQueue tas-main; preemptor effective priority: 3 (base: 3, boost: 0); preemptee effective priority: 1 (base: 1, boost: 0)").
-					Obj(),
-				utiltesting.MakeEventRecord("default", "foo", kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads, "Warning").
-					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" doesn't allow to fit any of 1 pod(s). Total nodes: 1; excluded: resource "cpu": 1. Pending the preemption of 1 workload(s)`).
 					Obj(),
 			},
 		},
@@ -5114,7 +6780,7 @@ func TestScheduleForTASPreemption(t *testing.T) {
 						Type:               kueue.WorkloadQuotaReserved,
 						Status:             metav1.ConditionFalse,
 						Reason:             kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads,
-						Message:            `couldn't assign flavors to pod set one: topology "tas-single-level" allows to fit only 1 out of 2 pod(s). Pending the preemption of 1 workload(s)`,
+						Message:            `couldn't assign flavors to pod set one: topology "tas-single-level" allows to fit only 1 out of 2 pod(s); all pods must fit in a single "kubernetes.io/hostname" topology domain. Pending the preemption of 1 workload(s)`,
 						LastTransitionTime: metav1.NewTime(now),
 					}).
 					Condition(metav1.Condition{
@@ -5202,7 +6868,7 @@ func TestScheduleForTASPreemption(t *testing.T) {
 					Message("Preempted workload default/low-priority-admitted (UID: low-priority-admitted-uid) in ClusterQueue tas-main; preemptor effective priority: 3 (base: 3, boost: 0); preemptee effective priority: 1 (base: 1, boost: 0)").
 					Obj(),
 				utiltesting.MakeEventRecord("default", "foo", kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads, "Warning").
-					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" allows to fit only 1 out of 2 pod(s). Pending the preemption of 1 workload(s)`).
+					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" allows to fit only 1 out of 2 pod(s); all pods must fit in a single "kubernetes.io/hostname" topology domain. Pending the preemption of 1 workload(s)`).
 					Obj(),
 			},
 		},
@@ -5294,7 +6960,7 @@ func TestScheduleForTASPreemption(t *testing.T) {
 						Type:               kueue.WorkloadQuotaReserved,
 						Status:             metav1.ConditionFalse,
 						Reason:             kueue.WorkloadQuotaReservedReasonWaitingForQuota,
-						Message:            `couldn't assign flavors to pod set one: topology "tas-single-level" allows to fit only 1 out of 2 pod(s)`,
+						Message:            `couldn't assign flavors to pod set one: topology "tas-single-level" allows to fit only 1 out of 2 pod(s); all pods must fit in a single "kubernetes.io/hostname" topology domain`,
 						LastTransitionTime: metav1.NewTime(now),
 					}).
 					Condition(metav1.Condition{
@@ -5320,7 +6986,7 @@ func TestScheduleForTASPreemption(t *testing.T) {
 			},
 			wantEvents: []utiltesting.EventRecord{
 				utiltesting.MakeEventRecord("default", "mid-priority-waiting", kueue.WorkloadQuotaReservedReasonWaitingForQuota, "Warning").
-					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" allows to fit only 1 out of 2 pod(s)`).
+					Message(`couldn't assign flavors to pod set one: topology "tas-single-level" allows to fit only 1 out of 2 pod(s); all pods must fit in a single "kubernetes.io/hostname" topology domain`).
 					Obj(),
 			},
 		},
@@ -5980,7 +7646,7 @@ func TestScheduleForTASPreemption(t *testing.T) {
 						Type:               kueue.WorkloadQuotaReserved,
 						Status:             metav1.ConditionFalse,
 						Reason:             kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads,
-						Message:            "couldn't assign flavors to pod set one: topology \"tas-single-level\" doesn't allow to fit any of 1 pod(s). Total nodes: 2; excluded: resource \"cpu\": 2. Pending the preemption of 1 workload(s)",
+						Message:            "couldn't assign flavors to pod set one: topology \"tas-single-level\" doesn't allow to fit any of 1 pod(s); all pods must fit in a single \"kubernetes.io/hostname\" topology domain. Total nodes: 2; excluded: resource \"cpu\": 2. Pending the preemption of 1 workload(s)",
 						LastTransitionTime: metav1.NewTime(now),
 					}).
 					Condition(metav1.Condition{
@@ -6011,7 +7677,7 @@ func TestScheduleForTASPreemption(t *testing.T) {
 						Type:               kueue.WorkloadQuotaReserved,
 						Status:             metav1.ConditionFalse,
 						Reason:             kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads,
-						Message:            "couldn't assign flavors to pod set one: topology \"tas-single-level\" doesn't allow to fit any of 1 pod(s). Total nodes: 2; excluded: resource \"cpu\": 2. Pending the preemption of 1 workload(s)",
+						Message:            "couldn't assign flavors to pod set one: topology \"tas-single-level\" doesn't allow to fit any of 1 pod(s); all pods must fit in a single \"kubernetes.io/hostname\" topology domain. Total nodes: 2; excluded: resource \"cpu\": 2. Pending the preemption of 1 workload(s)",
 						LastTransitionTime: metav1.NewTime(now),
 					}).
 					Condition(metav1.Condition{
@@ -6114,6 +7780,443 @@ func TestScheduleForTASPreemption(t *testing.T) {
 				utiltesting.MakeEventRecord("default", "wl-high-1", kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads, corev1.EventTypeWarning).Obj(),
 				utiltesting.MakeEventRecord("default", "wl-high-2", "PreemptedWorkload", corev1.EventTypeNormal).Obj(),
 				utiltesting.MakeEventRecord("default", "wl-high-2", kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads, corev1.EventTypeWarning).Obj(),
+			},
+			eventCmpOpts: cmp.Options{eventIgnoreMessage},
+		},
+		"workload with one PodSet needing preemption and another fitting no node reports TopologyPlacementFailed": {
+			// PodSet "one" fits the cpu quota only after preempting the lower-priority
+			// workload, while PodSet "two" fits the memory quota but needs more memory
+			// than any node has. Preemption cannot help, so the topology failure of
+			// "two" is why the workload is not admitted.
+			nodes:           defaultSingleNode,
+			topologies:      []kueue.Topology{defaultSingleLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASFlavor},
+			clusterQueues: []kueue.ClusterQueue{
+				*utiltestingapi.MakeClusterQueue("tas-main").
+					Preemption(kueue.ClusterQueuePreemption{WithinClusterQueue: kueue.PreemptionPolicyLowerPriority}).
+					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").
+						Resource(corev1.ResourceCPU, "5").
+						Resource(corev1.ResourceMemory, "50Gi").Obj()).
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					Queue("tas-main").
+					Priority(3).
+					PodSets(
+						*utiltestingapi.MakePodSet("one", 1).
+							RequiredTopologyRequest(corev1.LabelHostname).
+							Request(corev1.ResourceCPU, "2").
+							Obj(),
+						*utiltestingapi.MakePodSet("two", 1).
+							RequiredTopologyRequest(corev1.LabelHostname).
+							Request(corev1.ResourceMemory, "6Gi").
+							Obj(),
+					).
+					Obj(),
+				*utiltestingapi.MakeWorkload("low-priority-admitted", "default").
+					Queue("tas-main").
+					Priority(1).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "4").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(),
+						now,
+					).
+					AdmittedAt(true, now).
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "4").
+						Obj()).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					Queue("tas-main").
+					Priority(3).
+					PodSets(
+						*utiltestingapi.MakePodSet("one", 1).
+							RequiredTopologyRequest(corev1.LabelHostname).
+							Request(corev1.ResourceCPU, "2").
+							Obj(),
+						*utiltestingapi.MakePodSet("two", 1).
+							RequiredTopologyRequest(corev1.LabelHostname).
+							Request(corev1.ResourceMemory, "6Gi").
+							Obj(),
+					).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadQuotaReserved,
+						Status:             metav1.ConditionFalse,
+						Reason:             kueue.WorkloadQuotaReservedReasonTopologyPlacementFailed,
+						Message:            `couldn't assign flavors to pod set one: insufficient unused quota for cpu in flavor tas-default, 1 more needed; couldn't assign flavors to pod set two: topology "tas-single-level" doesn't allow to fit any of 1 pod(s); all pods must fit in a single "kubernetes.io/hostname" topology domain. Total nodes: 1; excluded: resource "memory": 1`,
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadAdmitted,
+						Status:             metav1.ConditionFalse,
+						Reason:             kueue.WorkloadAdmittedReasonNoReservation,
+						Message:            "The workload has no reservation",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					ResourceRequests(
+						kueue.PodSetRequest{
+							Name: "one",
+							Resources: corev1.ResourceList{
+								corev1.ResourceCPU: resource.MustParse("2"),
+							},
+						},
+						kueue.PodSetRequest{
+							Name: "two",
+							Resources: corev1.ResourceList{
+								corev1.ResourceMemory: resource.MustParse("6Gi"),
+							},
+						},
+					).
+					Obj(),
+				*utiltestingapi.MakeWorkload("low-priority-admitted", "default").
+					Queue("tas-main").
+					Priority(1).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Assignment(corev1.ResourceCPU, "tas-default", "4").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(),
+						now,
+					).
+					AdmittedAt(true, now).
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						RequiredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "4").
+						Obj()).
+					Obj(),
+			},
+			wantInadmissibleLeft: map[kueue.ClusterQueueReference][]workload.Reference{
+				"tas-main": {"default/foo"},
+			},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "foo", kueue.WorkloadQuotaReservedReasonTopologyPlacementFailed, corev1.EventTypeWarning).
+					Message(`couldn't assign flavors to pod set one: insufficient unused quota for cpu in flavor tas-default, 1 more needed; couldn't assign flavors to pod set two: topology "tas-single-level" doesn't allow to fit any of 1 pod(s); all pods must fit in a single "kubernetes.io/hostname" topology domain. Total nodes: 1; excluded: resource "memory": 1`).
+					Obj(),
+			},
+		},
+		"elastic replacement preempts with quota and topology pressure": {
+			featureGates: map[featuregate.Feature]bool{
+				features.TopologyAwareScheduling:             true,
+				features.ElasticJobsViaWorkloadSlices:        true,
+				features.ElasticJobsViaWorkloadSlicesWithTAS: true,
+			},
+			nodes: []corev1.Node{*testingnode.MakeNode("x1").
+				Label("tas-node", "true").Label(corev1.LabelHostname, "x1").
+				StatusAllocatable(corev1.ResourceList{
+					corev1.ResourceCPU:  resource.MustParse("4"),
+					corev1.ResourcePods: resource.MustParse("10"),
+				}).Ready().Obj()},
+			topologies:      []kueue.Topology{defaultSingleLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASFlavor},
+			clusterQueues: []kueue.ClusterQueue{*utiltestingapi.MakeClusterQueue("tas-main").
+				Preemption(kueue.ClusterQueuePreemption{WithinClusterQueue: kueue.PreemptionPolicyLowerPriority}).
+				ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").Resource(corev1.ResourceCPU, "4").Obj()).Obj()},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("old", "default").UID("old-uid").
+					Queue("tas-main").Priority(10).Annotation(constants.ElasticJobAnnotation, "true").
+					PodSets(*utiltestingapi.MakePodSet("workers", 2).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(
+						utiltestingapi.MakePodSetAssignment("workers").Count(2).
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).Obj()).Obj()).Obj(), now).
+					AdmittedAt(true, now).Obj(),
+				*utiltestingapi.MakeWorkload("victim", "default").UID("victim-uid").
+					Queue("tas-main").Priority(1).
+					PodSets(*utiltestingapi.MakePodSet("workers", 2).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(
+						utiltestingapi.MakePodSetAssignment("workers").Count(2).
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).Obj()).Obj()).Obj(), now).
+					AdmittedAt(true, now).Obj(),
+				*utiltestingapi.MakeWorkload("replacement", "default").UID("replacement-uid").JobUID("elastic-job").
+					Queue("tas-main").Priority(10).Annotation(constants.ElasticJobAnnotation, "true").
+					Annotation(workloadslicing.WorkloadSliceReplacementFor, "default/old").
+					Annotation(kueue.WorkloadSliceNameAnnotation, "old").
+					PodSets(*utiltestingapi.MakePodSet("workers", 4).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("old", "default").UID("old-uid").
+					Queue("tas-main").Priority(10).Annotation(constants.ElasticJobAnnotation, "true").
+					PodSets(*utiltestingapi.MakePodSet("workers", 2).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(
+						utiltestingapi.MakePodSetAssignment("workers").Count(2).
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).Obj()).Obj()).Obj(), now).
+					AdmittedAt(true, now).Obj(),
+				*utiltestingapi.MakeWorkload("replacement", "default").UID("replacement-uid").JobUID("elastic-job").
+					Queue("tas-main").Priority(10).Annotation(constants.ElasticJobAnnotation, "true").
+					Annotation(workloadslicing.WorkloadSliceReplacementFor, "default/old").
+					Annotation(kueue.WorkloadSliceNameAnnotation, "old").
+					PodSets(*utiltestingapi.MakePodSet("workers", 4).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
+					Condition(metav1.Condition{
+						Type: kueue.WorkloadQuotaReserved, Status: metav1.ConditionFalse,
+						Reason:             kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads,
+						Message:            "couldn't assign flavors to pod set workers: insufficient unused quota for cpu in flavor tas-default, 2 more needed. Pending the preemption of 1 workload(s)",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type: kueue.WorkloadAdmitted, Status: metav1.ConditionFalse,
+						Reason: kueue.WorkloadAdmittedReasonNoReservation, Message: "The workload has no reservation",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					ResourceRequests(kueue.PodSetRequest{Name: "workers", Resources: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}}).
+					Obj(),
+				*utiltestingapi.MakeWorkload("victim", "default").UID("victim-uid").
+					Queue("tas-main").Priority(1).
+					PodSets(*utiltestingapi.MakePodSet("workers", 2).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(
+						utiltestingapi.MakePodSetAssignment("workers").Count(2).
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).Obj()).Obj()).Obj(), now).
+					AdmittedAt(true, now).
+					Condition(metav1.Condition{
+						Type: kueue.WorkloadEvicted, Status: metav1.ConditionTrue,
+						Reason: "Preempted", Message: "Preempted to accommodate a workload (UID: replacement-uid, JobUID: elastic-job) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main", LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type: kueue.WorkloadPreempted, Status: metav1.ConditionTrue,
+						Reason: "InClusterQueue", Message: "Preempted to accommodate a workload (UID: replacement-uid, JobUID: elastic-job) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main", LastTransitionTime: metav1.NewTime(now),
+					}).
+					SchedulingStatsEviction(kueue.WorkloadSchedulingStatsEviction{Reason: "Preempted", Count: 1}).Obj(),
+			},
+			wantLeft: map[kueue.ClusterQueueReference][]workload.Reference{"tas-main": {"default/replacement"}},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "victim", "EvictedDueToPreempted", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "victim", "Preempted", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "replacement", "PreemptedWorkload", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "replacement", kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads, corev1.EventTypeWarning).Obj(),
+			},
+			eventCmpOpts: cmp.Options{eventIgnoreMessage},
+		},
+		"elastic replacement preempts with topology pressure only": {
+			featureGates: map[featuregate.Feature]bool{
+				features.TopologyAwareScheduling:             true,
+				features.ElasticJobsViaWorkloadSlices:        true,
+				features.ElasticJobsViaWorkloadSlicesWithTAS: true,
+			},
+			nodes: []corev1.Node{*testingnode.MakeNode("x1").
+				Label("tas-node", "true").Label(corev1.LabelHostname, "x1").
+				StatusAllocatable(corev1.ResourceList{
+					corev1.ResourceCPU:  resource.MustParse("4"),
+					corev1.ResourcePods: resource.MustParse("10"),
+				}).Ready().Obj()},
+			topologies:      []kueue.Topology{defaultSingleLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASFlavor},
+			clusterQueues: []kueue.ClusterQueue{*utiltestingapi.MakeClusterQueue("tas-main").
+				Preemption(kueue.ClusterQueuePreemption{WithinClusterQueue: kueue.PreemptionPolicyLowerPriority}).
+				ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").Resource(corev1.ResourceCPU, "20").Obj()).Obj()},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("old", "default").UID("old-uid").
+					Queue("tas-main").Priority(10).Annotation(constants.ElasticJobAnnotation, "true").
+					PodSets(*utiltestingapi.MakePodSet("workers", 2).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(
+						utiltestingapi.MakePodSetAssignment("workers").Count(2).
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).Obj()).Obj()).Obj(), now).
+					AdmittedAt(true, now).Obj(),
+				*utiltestingapi.MakeWorkload("victim", "default").UID("victim-uid").
+					Queue("tas-main").Priority(1).
+					PodSets(*utiltestingapi.MakePodSet("workers", 2).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(
+						utiltestingapi.MakePodSetAssignment("workers").Count(2).
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).Obj()).Obj()).Obj(), now).
+					AdmittedAt(true, now).Obj(),
+				*utiltestingapi.MakeWorkload("replacement", "default").UID("replacement-uid").JobUID("elastic-job").
+					Queue("tas-main").Priority(10).Annotation(constants.ElasticJobAnnotation, "true").
+					Annotation(workloadslicing.WorkloadSliceReplacementFor, "default/old").
+					Annotation(kueue.WorkloadSliceNameAnnotation, "old").
+					PodSets(*utiltestingapi.MakePodSet("workers", 4).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("old", "default").UID("old-uid").
+					Queue("tas-main").Priority(10).Annotation(constants.ElasticJobAnnotation, "true").
+					PodSets(*utiltestingapi.MakePodSet("workers", 2).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(
+						utiltestingapi.MakePodSetAssignment("workers").Count(2).
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).Obj()).Obj()).Obj(), now).
+					AdmittedAt(true, now).Obj(),
+				*utiltestingapi.MakeWorkload("replacement", "default").UID("replacement-uid").JobUID("elastic-job").
+					Queue("tas-main").Priority(10).Annotation(constants.ElasticJobAnnotation, "true").
+					Annotation(workloadslicing.WorkloadSliceReplacementFor, "default/old").
+					Annotation(kueue.WorkloadSliceNameAnnotation, "old").
+					PodSets(*utiltestingapi.MakePodSet("workers", 4).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
+					Condition(metav1.Condition{
+						Type: kueue.WorkloadQuotaReserved, Status: metav1.ConditionFalse,
+						Reason:             kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads,
+						Message:            "couldn't assign flavors to pod set workers: topology \"tas-single-level\" doesn't allow to fit any of 2 pod(s). Total nodes: 1; excluded: resource \"cpu\": 1. Pending the preemption of 1 workload(s)",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type: kueue.WorkloadAdmitted, Status: metav1.ConditionFalse,
+						Reason: kueue.WorkloadAdmittedReasonNoReservation, Message: "The workload has no reservation",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					ResourceRequests(kueue.PodSetRequest{Name: "workers", Resources: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}}).
+					Obj(),
+				*utiltestingapi.MakeWorkload("victim", "default").UID("victim-uid").
+					Queue("tas-main").Priority(1).
+					PodSets(*utiltestingapi.MakePodSet("workers", 2).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(
+						utiltestingapi.MakePodSetAssignment("workers").Count(2).
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).Obj()).Obj()).Obj(), now).
+					AdmittedAt(true, now).
+					Condition(metav1.Condition{
+						Type: kueue.WorkloadEvicted, Status: metav1.ConditionTrue,
+						Reason: "Preempted", Message: "Preempted to accommodate a workload (UID: replacement-uid, JobUID: elastic-job) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main", LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type: kueue.WorkloadPreempted, Status: metav1.ConditionTrue,
+						Reason: "InClusterQueue", Message: "Preempted to accommodate a workload (UID: replacement-uid, JobUID: elastic-job) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main", LastTransitionTime: metav1.NewTime(now),
+					}).
+					SchedulingStatsEviction(kueue.WorkloadSchedulingStatsEviction{Reason: "Preempted", Count: 1}).Obj(),
+			},
+			wantLeft: map[kueue.ClusterQueueReference][]workload.Reference{"tas-main": {"default/replacement"}},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "victim", "EvictedDueToPreempted", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "victim", "Preempted", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "replacement", "PreemptedWorkload", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "replacement", kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads, corev1.EventTypeWarning).Obj(),
+			},
+			eventCmpOpts: cmp.Options{eventIgnoreMessage},
+		},
+		"elastic replacement preempts with quota pressure only": {
+			featureGates: map[featuregate.Feature]bool{
+				features.TopologyAwareScheduling:             true,
+				features.ElasticJobsViaWorkloadSlices:        true,
+				features.ElasticJobsViaWorkloadSlicesWithTAS: true,
+			},
+			nodes: []corev1.Node{*testingnode.MakeNode("x1").
+				Label("tas-node", "true").Label(corev1.LabelHostname, "x1").
+				StatusAllocatable(corev1.ResourceList{
+					corev1.ResourceCPU:  resource.MustParse("20"),
+					corev1.ResourcePods: resource.MustParse("10"),
+				}).Ready().Obj()},
+			topologies:      []kueue.Topology{defaultSingleLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASFlavor},
+			clusterQueues: []kueue.ClusterQueue{*utiltestingapi.MakeClusterQueue("tas-main").
+				Preemption(kueue.ClusterQueuePreemption{WithinClusterQueue: kueue.PreemptionPolicyLowerPriority}).
+				ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").Resource(corev1.ResourceCPU, "4").Obj()).Obj()},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("old", "default").UID("old-uid").
+					Queue("tas-main").Priority(10).Annotation(constants.ElasticJobAnnotation, "true").
+					PodSets(*utiltestingapi.MakePodSet("workers", 2).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(
+						utiltestingapi.MakePodSetAssignment("workers").Count(2).
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).Obj()).Obj()).Obj(), now).
+					AdmittedAt(true, now).Obj(),
+				*utiltestingapi.MakeWorkload("victim", "default").UID("victim-uid").
+					Queue("tas-main").Priority(1).
+					PodSets(*utiltestingapi.MakePodSet("workers", 2).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(
+						utiltestingapi.MakePodSetAssignment("workers").Count(2).
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).Obj()).Obj()).Obj(), now).
+					AdmittedAt(true, now).Obj(),
+				*utiltestingapi.MakeWorkload("replacement", "default").UID("replacement-uid").JobUID("elastic-job").
+					Queue("tas-main").Priority(10).Annotation(constants.ElasticJobAnnotation, "true").
+					Annotation(workloadslicing.WorkloadSliceReplacementFor, "default/old").
+					Annotation(kueue.WorkloadSliceNameAnnotation, "old").
+					PodSets(*utiltestingapi.MakePodSet("workers", 4).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("old", "default").UID("old-uid").
+					Queue("tas-main").Priority(10).Annotation(constants.ElasticJobAnnotation, "true").
+					PodSets(*utiltestingapi.MakePodSet("workers", 2).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(
+						utiltestingapi.MakePodSetAssignment("workers").Count(2).
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).Obj()).Obj()).Obj(), now).
+					AdmittedAt(true, now).Obj(),
+				*utiltestingapi.MakeWorkload("replacement", "default").UID("replacement-uid").JobUID("elastic-job").
+					Queue("tas-main").Priority(10).Annotation(constants.ElasticJobAnnotation, "true").
+					Annotation(workloadslicing.WorkloadSliceReplacementFor, "default/old").
+					Annotation(kueue.WorkloadSliceNameAnnotation, "old").
+					PodSets(*utiltestingapi.MakePodSet("workers", 4).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
+					Condition(metav1.Condition{
+						Type: kueue.WorkloadQuotaReserved, Status: metav1.ConditionFalse,
+						Reason:             kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads,
+						Message:            "couldn't assign flavors to pod set workers: insufficient unused quota for cpu in flavor tas-default, 2 more needed. Pending the preemption of 1 workload(s)",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type: kueue.WorkloadAdmitted, Status: metav1.ConditionFalse,
+						Reason: kueue.WorkloadAdmittedReasonNoReservation, Message: "The workload has no reservation",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					ResourceRequests(kueue.PodSetRequest{Name: "workers", Resources: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}}).
+					Obj(),
+				*utiltestingapi.MakeWorkload("victim", "default").UID("victim-uid").
+					Queue("tas-main").Priority(1).
+					PodSets(*utiltestingapi.MakePodSet("workers", 2).
+						Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(
+						utiltestingapi.MakePodSetAssignment("workers").Count(2).
+							Assignment(corev1.ResourceCPU, "tas-default", "2").
+							TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 2).Obj()).Obj()).Obj()).Obj(), now).
+					AdmittedAt(true, now).
+					Condition(metav1.Condition{
+						Type: kueue.WorkloadEvicted, Status: metav1.ConditionTrue,
+						Reason: "Preempted", Message: "Preempted to accommodate a workload (UID: replacement-uid, JobUID: elastic-job) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main", LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type: kueue.WorkloadPreempted, Status: metav1.ConditionTrue,
+						Reason: "InClusterQueue", Message: "Preempted to accommodate a workload (UID: replacement-uid, JobUID: elastic-job) due to prioritization in the ClusterQueue; preemptor path: /tas-main; preemptee path: /tas-main", LastTransitionTime: metav1.NewTime(now),
+					}).
+					SchedulingStatsEviction(kueue.WorkloadSchedulingStatsEviction{Reason: "Preempted", Count: 1}).Obj(),
+			},
+			wantLeft: map[kueue.ClusterQueueReference][]workload.Reference{"tas-main": {"default/replacement"}},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "victim", "EvictedDueToPreempted", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "victim", "Preempted", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "replacement", "PreemptedWorkload", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "replacement", kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads, corev1.EventTypeWarning).Obj(),
 			},
 			eventCmpOpts: cmp.Options{eventIgnoreMessage},
 		},
@@ -6402,7 +8505,7 @@ func TestScheduleForTASCohorts(t *testing.T) {
 						Type:               kueue.WorkloadQuotaReserved,
 						Status:             metav1.ConditionFalse,
 						Reason:             kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads,
-						Message:            `couldn't assign flavors to pod set one: topology "tas-single-level" allows to fit only 1 out of 3 pod(s). Total nodes: 2; excluded: resource "cpu": 1. Pending the preemption of 2 workload(s)`,
+						Message:            `couldn't assign flavors to pod set one: topology "tas-single-level" allows to fit only 1 out of 3 pod(s); all pods must fit in a single "kubernetes.io/hostname" topology domain. Total nodes: 2; excluded: resource "cpu": 1. Pending the preemption of 2 workload(s)`,
 						LastTransitionTime: metav1.NewTime(now),
 					}).
 					Condition(metav1.Condition{
@@ -6591,7 +8694,7 @@ func TestScheduleForTASCohorts(t *testing.T) {
 						Type:               kueue.WorkloadQuotaReserved,
 						Status:             metav1.ConditionFalse,
 						Reason:             kueue.WorkloadQuotaReservedReasonWaitingForQuota,
-						Message:            `couldn't assign flavors to pod set one: topology "tas-single-level" doesn't allow to fit any of 1 pod(s). Total nodes: 1; excluded: resource "cpu": 1`,
+						Message:            `couldn't assign flavors to pod set one: topology "tas-single-level" doesn't allow to fit any of 1 pod(s); all pods must fit in a single "kubernetes.io/hostname" topology domain. Total nodes: 1; excluded: resource "cpu": 1`,
 						LastTransitionTime: metav1.NewTime(now),
 					}).
 					Condition(metav1.Condition{
@@ -7028,6 +9131,301 @@ func TestScheduleForTASCohorts(t *testing.T) {
 					Obj(),
 			},
 			wantLeft:     nil,
+			eventCmpOpts: cmp.Options{eventIgnoreMessage},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "a1", "QuotaReserved", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "a1", "Admitted", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "b1", "QuotaReserved", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "b1", "Admitted", corev1.EventTypeNormal).Obj(),
+			},
+		},
+		"two workloads nominated onto a node with one Pod slot; the second lands on the other node; TASRecomputeAssignmentWithinSchedulingCycle enabled": {
+			// x1 has CPU for both workloads but a single Pod slot, and both are
+			// nominated onto it. Once a1 takes the slot, b1 is recomputed onto y1.
+			featureGates: map[featuregate.Feature]bool{
+				features.TASRecomputeAssignmentWithinSchedulingCycle: true,
+			},
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label("tas-node", "true").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("3"),
+						corev1.ResourceMemory: resource.MustParse("5Gi"),
+						corev1.ResourcePods:   resource.MustParse("1"),
+					}).
+					Ready().
+					Obj(),
+				defaultNodeY1,
+			},
+			topologies:      []kueue.Topology{defaultSingleLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASFlavor},
+			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueueA, defaultClusterQueueB},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("a1", "default").
+					Priority(2).
+					Queue("tas-lq-a").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						PreferredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					Obj(),
+				*utiltestingapi.MakeWorkload("b1", "default").
+					Priority(1).
+					Queue("tas-lq-b").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						PreferredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("a1", "default").
+					Priority(2).
+					Queue("tas-lq-a").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						PreferredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadQuotaReserved,
+						Status:             metav1.ConditionTrue,
+						Reason:             "QuotaReserved",
+						Message:            "Quota reserved in ClusterQueue tas-cq-a",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadAdmitted,
+						Status:             metav1.ConditionTrue,
+						Reason:             "Admitted",
+						Message:            "The workload is admitted",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Admission(
+						utiltestingapi.MakeAdmission("tas-cq-a").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Count(1).
+								Assignment(corev1.ResourceCPU, "tas-default", "1").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(),
+					).
+					Obj(),
+				*utiltestingapi.MakeWorkload("b1", "default").
+					Priority(1).
+					Queue("tas-lq-b").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						PreferredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadQuotaReserved,
+						Status:             metav1.ConditionTrue,
+						Reason:             "QuotaReserved",
+						Message:            "Quota reserved in ClusterQueue tas-cq-b",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadAdmitted,
+						Status:             metav1.ConditionTrue,
+						Reason:             "Admitted",
+						Message:            "The workload is admitted",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Admission(
+						utiltestingapi.MakeAdmission("tas-cq-b").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Count(1).
+								Assignment(corev1.ResourceCPU, "tas-default", "1").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"y1"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(),
+					).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/a1": *utiltestingapi.MakeAdmission("tas-cq-a").
+					PodSets(utiltestingapi.MakePodSetAssignment("one").
+						Assignment(corev1.ResourceCPU, "tas-default", "1").
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+							Obj()).
+						Obj()).
+					Obj(),
+				"default/b1": *utiltestingapi.MakeAdmission("tas-cq-b").
+					PodSets(utiltestingapi.MakePodSetAssignment("one").
+						Assignment(corev1.ResourceCPU, "tas-default", "1").
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"y1"}, 1).Obj()).
+							Obj()).
+						Obj()).
+					Obj(),
+			},
+			eventCmpOpts: cmp.Options{eventIgnoreMessage},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "a1", "QuotaReserved", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "a1", "Admitted", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "b1", "QuotaReserved", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "b1", "Admitted", corev1.EventTypeNormal).Obj(),
+			},
+		},
+		"a workload's two PodSets no longer fit together on their node after another workload is admitted there; TASRecomputeAssignmentWithinSchedulingCycle enabled": {
+			// a1 and both PodSets of b1 are nominated onto x1, which fits either
+			// workload but not both, so b1 is recomputed and its second PodSet
+			// goes to y1.
+			featureGates: map[featuregate.Feature]bool{
+				features.TASRecomputeAssignmentWithinSchedulingCycle: true,
+			},
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label("tas-node", "true").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("4"),
+						corev1.ResourceMemory: resource.MustParse("5Gi"),
+						corev1.ResourcePods:   resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("y1").
+					Label("tas-node", "true").
+					Label(corev1.LabelHostname, "y1").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("8"),
+						corev1.ResourceMemory: resource.MustParse("3Gi"),
+						corev1.ResourcePods:   resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			topologies:      []kueue.Topology{defaultSingleLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASFlavor},
+			clusterQueues:   []kueue.ClusterQueue{defaultClusterQueueA, defaultClusterQueueB},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("a1", "default").
+					Priority(2).
+					Queue("tas-lq-a").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						PreferredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "2").
+						Obj()).
+					Obj(),
+				*utiltestingapi.MakeWorkload("b1", "default").
+					Priority(1).
+					Queue("tas-lq-b").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						PreferredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "2").
+						Obj(), *utiltestingapi.MakePodSet("two", 1).
+						PreferredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "2").
+						Obj()).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("a1", "default").
+					Priority(2).
+					Queue("tas-lq-a").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						PreferredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "2").
+						Obj()).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadQuotaReserved,
+						Status:             metav1.ConditionTrue,
+						Reason:             "QuotaReserved",
+						Message:            "Quota reserved in ClusterQueue tas-cq-a",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadAdmitted,
+						Status:             metav1.ConditionTrue,
+						Reason:             "Admitted",
+						Message:            "The workload is admitted",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Admission(
+						utiltestingapi.MakeAdmission("tas-cq-a").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Count(1).
+								Assignment(corev1.ResourceCPU, "tas-default", "2").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(),
+					).
+					Obj(),
+				*utiltestingapi.MakeWorkload("b1", "default").
+					Priority(1).
+					Queue("tas-lq-b").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).
+						PreferredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "2").
+						Obj(), *utiltestingapi.MakePodSet("two", 1).
+						PreferredTopologyRequest(corev1.LabelHostname).
+						Request(corev1.ResourceCPU, "2").
+						Obj()).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadQuotaReserved,
+						Status:             metav1.ConditionTrue,
+						Reason:             "QuotaReserved",
+						Message:            "Quota reserved in ClusterQueue tas-cq-b",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Condition(metav1.Condition{
+						Type:               kueue.WorkloadAdmitted,
+						Status:             metav1.ConditionTrue,
+						Reason:             "Admitted",
+						Message:            "The workload is admitted",
+						LastTransitionTime: metav1.NewTime(now),
+					}).
+					Admission(
+						utiltestingapi.MakeAdmission("tas-cq-b").
+							PodSets(utiltestingapi.MakePodSetAssignment("one").
+								Count(1).
+								Assignment(corev1.ResourceCPU, "tas-default", "2").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+									Obj()).
+								Obj(), utiltestingapi.MakePodSetAssignment("two").
+								Count(1).
+								Assignment(corev1.ResourceCPU, "tas-default", "2").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"y1"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(),
+					).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/a1": *utiltestingapi.MakeAdmission("tas-cq-a").
+					PodSets(utiltestingapi.MakePodSetAssignment("one").
+						Assignment(corev1.ResourceCPU, "tas-default", "2").
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+							Obj()).
+						Obj()).
+					Obj(),
+				"default/b1": *utiltestingapi.MakeAdmission("tas-cq-b").
+					PodSets(utiltestingapi.MakePodSetAssignment("one").
+						Assignment(corev1.ResourceCPU, "tas-default", "2").
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+							Obj()).
+						Obj(), utiltestingapi.MakePodSetAssignment("two").
+						Assignment(corev1.ResourceCPU, "tas-default", "2").
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology)).
+							Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"y1"}, 1).Obj()).
+							Obj()).
+						Obj()).
+					Obj(),
+			},
 			eventCmpOpts: cmp.Options{eventIgnoreMessage},
 			wantEvents: []utiltesting.EventRecord{
 				utiltesting.MakeEventRecord("default", "a1", "QuotaReserved", corev1.EventTypeNormal).Obj(),
@@ -8147,7 +10545,7 @@ func TestScheduleForTASCohorts(t *testing.T) {
 						Type:               kueue.WorkloadQuotaReserved,
 						Status:             metav1.ConditionFalse,
 						Reason:             kueue.WorkloadQuotaReservedReasonTopologyPlacementFailed,
-						Message:            `couldn't assign flavors to pod set two: topology "tas-single-level" doesn't allow to fit any of 1 pod(s). Total nodes: 1; excluded: resource "pods": 1`,
+						Message:            `couldn't assign flavors to pod set two: topology "tas-single-level" doesn't allow to fit any of 1 pod(s); all pods must fit in a single "kubernetes.io/hostname" topology domain. Total nodes: 1; excluded: resource "pods": 1`,
 						LastTransitionTime: metav1.NewTime(now),
 					}).
 					Condition(metav1.Condition{
@@ -8929,7 +11327,7 @@ func TestScheduleForTASCohorts(t *testing.T) {
 						Type:               kueue.WorkloadQuotaReserved,
 						Status:             metav1.ConditionFalse,
 						Reason:             kueue.WorkloadQuotaReservedReasonWaitingForPreemptedWorkloads,
-						Message:            `couldn't assign flavors to pod set one: topology "tas-single-level" allows to fit only 1 out of 3 pod(s). Total nodes: 2; excluded: resource "cpu": 1. Pending the preemption of 2 workload(s)`,
+						Message:            `couldn't assign flavors to pod set one: topology "tas-single-level" allows to fit only 1 out of 3 pod(s); all pods must fit in a single "kubernetes.io/hostname" topology domain. Total nodes: 2; excluded: resource "cpu": 1. Pending the preemption of 2 workload(s)`,
 						LastTransitionTime: metav1.NewTime(now),
 					}).
 					Condition(metav1.Condition{
@@ -10398,7 +12796,22 @@ func TestScheduleForTASWhenWorkloadModifiedConcurrently(t *testing.T) {
 									return err
 								}
 							}
-							return utiltesting.TreatSSAAsStrategicMerge(ctx, c, subResourceName, obj, patch, opts...)
+							return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+						},
+						SubResourceApply: func(ctx context.Context, c client.Client, subResourceName string, applyConf runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+							if subResourceName == "status" && !patched {
+								patched = true
+								// Simulate concurrent modification by another controller
+								wlCopy := tc.workload.DeepCopy()
+								if wlCopy.Labels == nil {
+									wlCopy.Labels = make(map[string]string, 1)
+								}
+								wlCopy.Labels["test.kueue.x-k8s.io/timestamp"] = time.Now().String()
+								if err := c.Update(ctx, wlCopy); err != nil {
+									return err
+								}
+							}
+							return utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration(ctx, c, subResourceName, applyConf, opts...)
 						},
 					})
 
@@ -10611,7 +13024,13 @@ func TestSecondPassSkipsWaitForPodsReadyBlock(t *testing.T) {
 						if _, ok := obj.(*kueue.Workload); ok && subResourceName == "status" {
 							statusPatches++
 						}
-						return utiltesting.TreatSSAAsStrategicMerge(ctx, c, subResourceName, obj, patch, opts...)
+						return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+					},
+					SubResourceApply: func(ctx context.Context, c client.Client, subResourceName string, applyConf runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+						if subResourceName == "status" {
+							statusPatches++
+						}
+						return utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration(ctx, c, subResourceName, applyConf, opts...)
 					},
 				})
 			_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
@@ -10637,7 +13056,11 @@ func TestSecondPassSkipsWaitForPodsReadyBlock(t *testing.T) {
 			}
 			// Contributes the reserved usage and, with pods-ready tracking on, places
 			// the workload in its ClusterQueue's WorkloadsNotReady set.
-			cqCache.AddOrUpdateWorkload(log, tc.workload.DeepCopy())
+			storedWl := &kueue.Workload{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(tc.workload), storedWl); err != nil {
+				t.Fatalf("Getting workload: %v", err)
+			}
+			cqCache.AddOrUpdateWorkload(t.Context(), log, storedWl)
 			if !qManager.QueueSecondPassIfNeeded(ctx, tc.workload, 0) {
 				t.Fatal("expected the workload to be queued for a second pass")
 			}
@@ -10671,6 +13094,1012 @@ func TestSecondPassSkipsWaitForPodsReadyBlock(t *testing.T) {
 			tc.verify(t, &got)
 			if statusPatches != 1 {
 				t.Errorf("got %d workload status patches, want 1: an extra patch means the admission block stripped and re-established the workload's own reservation", statusPatches)
+			}
+		})
+	}
+}
+
+// A second pass that fails while an update has already queued the next one must
+// leave the Workload, and its reservation, with the second-pass queue.
+// See https://github.com/kubernetes-sigs/kueue/issues/16330.
+func TestFailedSecondPassKeepsReservationWhenAlreadyPrequeued(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+
+	ns := utiltesting.MakeNamespaceWrapper(metav1.NamespaceDefault).Obj()
+	topology := utiltestingapi.MakeDefaultOneLevelTopology("tas-single-level")
+	rf := utiltestingapi.MakeResourceFlavor("tas-default").
+		NodeLabel("tas-node", "true").
+		TopologyName(topology.Name).
+		Obj()
+	provCheck := utiltestingapi.MakeAdmissionCheck("prov-check").
+		ControllerName(kueue.ProvisioningRequestControllerName).
+		Condition(metav1.Condition{
+			Type:   kueue.AdmissionCheckActive,
+			Status: metav1.ConditionTrue,
+		}).
+		Obj()
+	cqWrapper := utiltestingapi.MakeClusterQueue("tas-main").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").
+			Resource(corev1.ResourceCPU, "50").Obj()).
+		AdmissionChecks(kueue.AdmissionCheckReference(provCheck.Name))
+	cq := cqWrapper.Clone().Obj()
+	stoppedCQ := cqWrapper.Clone().StopPolicy(kueue.Hold).Obj()
+	lq := utiltestingapi.MakeLocalQueue("tas-main", ns.Name).ClusterQueue(cq.Name).Obj()
+	// No node is ready, so every second pass fails.
+	node := testingnode.MakeNode("x1").
+		Label("tas-node", "true").
+		Label(corev1.LabelHostname, "x1").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU:  resource.MustParse("1"),
+			corev1.ResourcePods: resource.MustParse("10"),
+		}).
+		NotReady().
+		Obj()
+	podSet := *utiltestingapi.MakePodSet("one", 1).
+		RequiredTopologyRequest(corev1.LabelHostname).
+		Request(corev1.ResourceCPU, "1").
+		Obj()
+
+	failedNodeWorkload := utiltestingapi.MakeWorkload("wl", ns.Name).
+		Queue("tas-main").
+		UnhealthyNodes("x1").
+		PodSets(podSet).
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("tas-main").
+				PodSets(utiltestingapi.MakePodSetAssignment("one").
+					Assignment(corev1.ResourceCPU, "tas-default", "1000m").
+					TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+						Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+						Obj()).
+					Obj()).
+				Obj(),
+			now,
+		).
+		AdmissionCheck(kueue.AdmissionCheckState{
+			Name:  "prov-check",
+			State: kueue.CheckStateReady,
+		}).
+		AdmittedAt(true, now).
+		Obj()
+
+	delayedWorkload := utiltestingapi.MakeWorkload("wl", ns.Name).
+		Queue("tas-main").
+		PodSets(podSet).
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("tas-main").
+				PodSets(utiltestingapi.MakePodSetAssignment("one").
+					Assignment(corev1.ResourceCPU, "tas-default", "1000m").
+					DelayedTopologyRequest(kueue.DelayedTopologyRequestStatePending).
+					Obj()).
+				Obj(),
+			now,
+		).
+		AdmissionCheck(kueue.AdmissionCheckState{
+			Name:  "prov-check",
+			State: kueue.CheckStateReady,
+		}).
+		Obj()
+
+	newCase := func(wl *kueue.Workload, clusterQueue *kueue.ClusterQueue, failure string) tasScheduleTestCase {
+		failed := utiltesting.MakeEventRecord(ns.Name, "wl", "SecondPassFailed", corev1.EventTypeWarning).Message(failure).Obj()
+		return tasScheduleTestCase{
+			nodes:                            []corev1.Node{*node},
+			topologies:                       []kueue.Topology{*topology},
+			resourceFlavors:                  []kueue.ResourceFlavor{*rf},
+			clusterQueues:                    []kueue.ClusterQueue{*clusterQueue},
+			admissionChecks:                  []kueue.AdmissionCheck{*provCheck},
+			workloads:                        []kueue.Workload{*wl},
+			prequeuedSecondPasses:            []workload.Reference{workload.Key(wl)},
+			wantWorkloads:                    []kueue.Workload{*wl},
+			wantWorkloadsAfterSecondSchedule: []kueue.Workload{*wl},
+			wantEvents:                       []utiltesting.EventRecord{failed, failed},
+		}
+	}
+	noDomains := "couldn't assign flavors to pod set one: no topology domains at level: kubernetes.io/hostname"
+	failedNodeReplacement := newCase(failedNodeWorkload, cq, noDomains)
+	// With fail-fast, a failed topology assignment evicts the Workload instead.
+	failedNodeReplacement.featureGates = map[featuregate.Feature]bool{features.TASFailedNodeReplacementFailFast: false}
+
+	runTASScheduleTestCases(t, tasScheduleTestConfig{
+		queues: []kueue.LocalQueue{*lq},
+		now:    now,
+	}, map[string]tasScheduleTestCase{
+		"delayed topology assignment": newCase(delayedWorkload, cq, noDomains),
+		"failed node replacement":     failedNodeReplacement,
+		// Reachable with default gates: fail-fast only applies to a nominated pass.
+		"failed node replacement in a stopped ClusterQueue": newCase(failedNodeWorkload, stoppedCQ, "ClusterQueue tas-main is inactive"),
+	})
+}
+
+func TestSecondPassAdmissionWriteFailureKeepsReservation(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+
+	ns := utiltesting.MakeNamespaceWrapper(metav1.NamespaceDefault).Obj()
+	topology := utiltestingapi.MakeDefaultOneLevelTopology("tas-single-level")
+	rf := utiltestingapi.MakeResourceFlavor("tas-default").
+		NodeLabel("tas-node", "true").
+		TopologyName(topology.Name).
+		Obj()
+	cq := utiltestingapi.MakeClusterQueue("tas-main").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").
+			Resource(corev1.ResourceCPU, "50").Obj()).
+		Obj()
+	lq := utiltestingapi.MakeLocalQueue("tas-main", ns.Name).ClusterQueue(cq.Name).Obj()
+	makeNode := func(name string) corev1.Node {
+		return *testingnode.MakeNode(name).
+			Label("tas-node", "true").
+			Label(corev1.LabelHostname, name).
+			StatusAllocatable(corev1.ResourceList{
+				corev1.ResourceCPU:  resource.MustParse("1"),
+				corev1.ResourcePods: resource.MustParse("10"),
+			}).
+			Ready().
+			Obj()
+	}
+	nodes := []corev1.Node{makeNode("x1"), makeNode("x2")}
+	wl := utiltestingapi.MakeWorkload("wl", ns.Name).
+		Queue("tas-main").
+		UnhealthyNodes("x1").
+		PodSets(*utiltestingapi.MakePodSet("one", 1).
+			RequiredTopologyRequest(corev1.LabelHostname).
+			Request(corev1.ResourceCPU, "1").
+			Obj()).
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("tas-main").
+				PodSets(utiltestingapi.MakePodSetAssignment("one").
+					Assignment(corev1.ResourceCPU, "tas-default", "1000m").
+					TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+						Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+						Obj()).
+					Obj()).
+				Obj(),
+			now,
+		).
+		AdmittedAt(true, now).
+		Obj()
+
+	type secondPassFixture struct {
+		wl              *kueue.Workload
+		cq              *kueue.ClusterQueue
+		admissionChecks []*kueue.AdmissionCheck
+		// verify checks the workload stored by the retried pass.
+		verify func(t *testing.T, got *kueue.Workload, useMergePatch bool)
+	}
+	failedNodePass := secondPassFixture{
+		wl: wl,
+		cq: cq,
+		verify: func(t *testing.T, got *kueue.Workload, useMergePatch bool) {
+			t.Helper()
+			gotNodes := sets.New[string]()
+			if got.Status.Admission != nil {
+				for value := range utiltas.LowestLevelValues(got.Status.Admission.PodSetAssignments[0].TopologyAssignment) {
+					gotNodes.Insert(value)
+				}
+			}
+			if diff := cmp.Diff(sets.New("x2"), gotNodes); diff != "" {
+				t.Errorf("unexpected nodes in the stored topology assignment (-want,+got):\n%s", diff)
+			}
+			// The fake client with patch.Apply cannot reset the UnhealthyNodes field (patch.Merge can).
+			if useMergePatch && len(got.Status.UnhealthyNodes) != 0 {
+				t.Errorf("the stored workload still has unhealthy nodes %v after the replacement", got.Status.UnhealthyNodes)
+			}
+		},
+	}
+	// A delayed topology assignment takes its second pass once its ProvisioningRequest check is Ready.
+	provCheck := utiltestingapi.MakeAdmissionCheck("prov-check").
+		ControllerName(kueue.ProvisioningRequestControllerName).
+		Condition(metav1.Condition{
+			Type:   kueue.AdmissionCheckActive,
+			Status: metav1.ConditionTrue,
+		}).
+		Obj()
+	delayedPass := secondPassFixture{
+		wl: utiltestingapi.MakeWorkload("wl", ns.Name).
+			Queue("tas-main").
+			PodSets(*utiltestingapi.MakePodSet("one", 1).
+				RequiredTopologyRequest(corev1.LabelHostname).
+				Request(corev1.ResourceCPU, "1").
+				Obj()).
+			ReserveQuotaAt(
+				utiltestingapi.MakeAdmission("tas-main").
+					PodSets(utiltestingapi.MakePodSetAssignment("one").
+						Assignment(corev1.ResourceCPU, "tas-default", "1000m").
+						DelayedTopologyRequest(kueue.DelayedTopologyRequestStatePending).
+						Obj()).
+					Obj(),
+				now,
+			).
+			AdmissionCheck(kueue.AdmissionCheckState{
+				Name:  kueue.AdmissionCheckReference(provCheck.Name),
+				State: kueue.CheckStateReady,
+			}).
+			Obj(),
+		cq: utiltestingapi.MakeClusterQueue("tas-main").
+			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").
+				Resource(corev1.ResourceCPU, "50").Obj()).
+			AdmissionChecks(kueue.AdmissionCheckReference(provCheck.Name)).
+			Obj(),
+		admissionChecks: []*kueue.AdmissionCheck{provCheck},
+		verify: func(t *testing.T, got *kueue.Workload, _ bool) {
+			t.Helper()
+			if got.Status.Admission == nil {
+				t.Fatal("the stored workload has no admission")
+			}
+			psa := got.Status.Admission.PodSetAssignments[0]
+			if psa.TopologyAssignment == nil || psa.DelayedTopologyRequest == nil ||
+				*psa.DelayedTopologyRequest != kueue.DelayedTopologyRequestStateReady {
+				t.Errorf("expected the retried pass to complete the delayed topology assignment, got assignment %v, delayed state %v",
+					psa.TopologyAssignment, psa.DelayedTopologyRequest)
+			}
+		},
+	}
+
+	cases := map[string]struct {
+		secondPass secondPassFixture
+		// writeErr fails the first status write; later writes reach the client.
+		writeErr   error
+		wantEvents []utiltesting.EventRecord
+	}{
+		"conflict": {
+			secondPass: failedNodePass,
+			writeErr:   apierrors.NewConflict(kueue.Resource("workloads"), wl.Name, errors.New("the object has been modified")),
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord(ns.Name, wl.Name, "OutdatedScheduleCycle", corev1.EventTypeWarning).Obj(),
+				utiltesting.MakeEventRecord(ns.Name, wl.Name, "SecondPassFailed", corev1.EventTypeWarning).Obj(),
+			},
+		},
+		"internal error": {
+			secondPass: failedNodePass,
+			writeErr:   apierrors.NewInternalError(errors.New("etcd unavailable")),
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord(ns.Name, wl.Name, "SecondPassFailed", corev1.EventTypeWarning).Obj(),
+			},
+		},
+		"conflict on a delayed topology assignment": {
+			secondPass: delayedPass,
+			writeErr:   apierrors.NewConflict(kueue.Resource("workloads"), wl.Name, errors.New("the object has been modified")),
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord(ns.Name, wl.Name, "OutdatedScheduleCycle", corev1.EventTypeWarning).Obj(),
+				utiltesting.MakeEventRecord(ns.Name, wl.Name, "SecondPassFailed", corev1.EventTypeWarning).Obj(),
+			},
+		},
+		"internal error on a delayed topology assignment": {
+			secondPass: delayedPass,
+			writeErr:   apierrors.NewInternalError(errors.New("etcd unavailable")),
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord(ns.Name, wl.Name, "SecondPassFailed", corev1.EventTypeWarning).Obj(),
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		for _, useMergePatch := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s when the WorkloadRequestUseMergePatch feature is %t", name, useMergePatch), func(t *testing.T) {
+				features.SetFeatureGateDuringTest(t, features.WorkloadRequestUseMergePatch, useMergePatch)
+				ctx, log := utiltesting.ContextWithLog(t)
+				wl, cq := tc.secondPass.wl, tc.secondPass.cq
+
+				var statusWrites int
+				var storedRV string
+				clientBuilder := utiltesting.NewClientBuilder().
+					WithObjects(ns.DeepCopy(), topology.DeepCopy(), rf.DeepCopy(), cq.DeepCopy(), lq.DeepCopy(), wl.DeepCopy()).
+					WithStatusSubresource(&kueue.Workload{}).
+					WithInterceptorFuncs(interceptor.Funcs{
+						SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+							if _, ok := obj.(*kueue.Workload); ok && subResourceName == "status" {
+								statusWrites++
+								// A strict merge patch carries the resourceVersion the pass read, so the apiserver can reject a stale write.
+								var body struct {
+									Metadata struct {
+										ResourceVersion string `json:"resourceVersion"`
+									} `json:"metadata"`
+								}
+								if data, err := patch.Data(obj); err != nil {
+									t.Errorf("Reading the status patch: %v", err)
+								} else if err := json.Unmarshal(data, &body); err != nil {
+									t.Errorf("Parsing the status patch %s: %v", data, err)
+								} else if gotRV := body.Metadata.ResourceVersion; gotRV != storedRV {
+									t.Errorf("status patch carries resourceVersion %q, want %q: a second-pass write must be strict", gotRV, storedRV)
+								}
+								if statusWrites == 1 {
+									return tc.writeErr
+								}
+							}
+							return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+						},
+						SubResourceApply: func(ctx context.Context, c client.Client, subResourceName string, applyConf runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+							if subResourceName == "status" {
+								statusWrites++
+								// A strict apply carries the resourceVersion the pass read, so the apiserver can reject a stale write.
+								applied, ok := applyConf.(interface{ GetResourceVersion() string })
+								if !ok {
+									t.Errorf("status apply configuration %T does not expose a resourceVersion", applyConf)
+								} else if gotRV := applied.GetResourceVersion(); gotRV != storedRV {
+									t.Errorf("status apply carries resourceVersion %q, want %q: a second-pass write must be strict", gotRV, storedRV)
+								}
+								if statusWrites == 1 {
+									return tc.writeErr
+								}
+							}
+							return utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration(ctx, c, subResourceName, applyConf, opts...)
+						},
+					})
+				_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
+				cl := clientBuilder.Build()
+				storedWl := &kueue.Workload{}
+				if err := cl.Get(ctx, client.ObjectKeyFromObject(wl), storedWl); err != nil {
+					t.Fatalf("Getting workload %s: %v", wl.Name, err)
+				}
+				storedRV = storedWl.ResourceVersion
+				if storedRV == "" {
+					t.Fatal("the stored workload has no resourceVersion")
+				}
+				recorder := &utiltesting.EventRecorder{}
+				fakeClock := testingclock.NewFakeClock(now)
+				cqCache := schdcache.New(cl)
+				qManager := qcache.NewManagerForUnitTests(cl, cqCache, qcache.WithClock(fakeClock))
+				for _, node := range nodes {
+					cqCache.TASCache().SyncNode(&node)
+				}
+				for _, ac := range tc.secondPass.admissionChecks {
+					cqCache.AddOrUpdateAdmissionCheck(log, ac.DeepCopy())
+				}
+				cqCache.AddOrUpdateResourceFlavor(log, rf.DeepCopy())
+				cqCache.AddOrUpdateTopology(log, topology.DeepCopy())
+				if err := cqCache.AddClusterQueue(ctx, cq.DeepCopy()); err != nil {
+					t.Fatalf("Inserting clusterQueue %s in cache: %v", cq.Name, err)
+				}
+				if err := qManager.AddClusterQueue(ctx, cq.DeepCopy()); err != nil {
+					t.Fatalf("Inserting clusterQueue %s in manager: %v", cq.Name, err)
+				}
+				if err := qManager.AddLocalQueue(ctx, lq.DeepCopy()); err != nil {
+					t.Fatalf("Inserting queue %s/%s in manager: %v", lq.Namespace, lq.Name, err)
+				}
+				cqCache.AddOrUpdateWorkload(t.Context(), log, storedWl.DeepCopy())
+				if !qManager.QueueSecondPassIfNeeded(ctx, storedWl, 0) {
+					t.Fatal("expected the workload to be queued for a second pass")
+				}
+				fakeClock.Step(time.Second)
+				watcher := &workloadUpdateWatcherRecorder{}
+				qManager.AddWorkloadUpdateWatcher(watcher)
+
+				scheduler := New(qManager, cqCache, cl, recorder, WithClock(t, fakeClock), WithPreemptionExpectations(preemptexpectations.New()))
+				wg := sync.WaitGroup{}
+				scheduler.setAdmissionRoutineWrapper(routine.NewWrapper(
+					func() { wg.Add(1) },
+					func() { wg.Done() },
+				))
+
+				ctx, cancel := context.WithTimeout(ctx, queueingTimeout)
+				defer cancel()
+				go cqCache.CleanUpOnContext(ctx)
+				go qManager.CleanUpOnContext(ctx)
+
+				scheduler.schedule(ctx)
+				wg.Wait()
+
+				if statusWrites != 1 {
+					t.Errorf("got %d workload status writes, want 1: a second-pass write must not retry", statusWrites)
+				}
+				if cqCache.ClusterQueueEmpty(kueue.ClusterQueueReference(cq.Name)) {
+					t.Error("the failed second-pass write dropped the workload's live reservation from the ClusterQueue cache")
+				}
+				if watcher.oldWl != nil || watcher.newWl != nil {
+					t.Error("the failed second-pass write must not notify workload update watchers")
+				}
+				if diff := cmp.Diff(tc.wantEvents, recorder.RecordedEvents, cmpopts.IgnoreFields(utiltesting.EventRecord{}, "Message")); diff != "" {
+					t.Errorf("unexpected events (-want,+got):\n%s", diff)
+				}
+
+				// The failed write left the workload unchanged, so the retried pass must still be able to write the replacement.
+				fakeClock.Step(time.Minute)
+				scheduler.schedule(ctx)
+				wg.Wait()
+
+				if statusWrites != 2 {
+					t.Errorf("got %d workload status writes, want 2: the retried second pass must write the replacement", statusWrites)
+				}
+				if cqCache.ClusterQueueEmpty(kueue.ClusterQueueReference(cq.Name)) {
+					t.Error("the retried second pass left the workload's reservation out of the ClusterQueue cache")
+				}
+				var got kueue.Workload
+				if err := cl.Get(ctx, client.ObjectKeyFromObject(wl), &got); err != nil {
+					t.Fatalf("Getting workload %s: %v", wl.Name, err)
+				}
+				tc.secondPass.verify(t, &got, useMergePatch)
+			})
+		}
+	}
+}
+
+func TestSecondPassAdmissionWriteNotFoundDropsWorkload(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+
+	ns := utiltesting.MakeNamespaceWrapper(metav1.NamespaceDefault).Obj()
+	topology := utiltestingapi.MakeDefaultOneLevelTopology("tas-single-level")
+	rf := utiltestingapi.MakeResourceFlavor("tas-default").
+		NodeLabel("tas-node", "true").
+		TopologyName(topology.Name).
+		Obj()
+	cq := utiltestingapi.MakeClusterQueue("tas-main").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").
+			Resource(corev1.ResourceCPU, "50").Obj()).
+		Obj()
+	lq := utiltestingapi.MakeLocalQueue("tas-main", ns.Name).ClusterQueue(cq.Name).Obj()
+	makeNode := func(name string) corev1.Node {
+		return *testingnode.MakeNode(name).
+			Label("tas-node", "true").
+			Label(corev1.LabelHostname, name).
+			StatusAllocatable(corev1.ResourceList{
+				corev1.ResourceCPU:  resource.MustParse("1"),
+				corev1.ResourcePods: resource.MustParse("10"),
+			}).
+			Ready().
+			Obj()
+	}
+	nodes := []corev1.Node{makeNode("x1"), makeNode("x2")}
+	wl := utiltestingapi.MakeWorkload("wl", ns.Name).
+		Queue("tas-main").
+		UnhealthyNodes("x1").
+		PodSets(*utiltestingapi.MakePodSet("one", 1).
+			RequiredTopologyRequest(corev1.LabelHostname).
+			Request(corev1.ResourceCPU, "1").
+			Obj()).
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("tas-main").
+				PodSets(utiltestingapi.MakePodSetAssignment("one").
+					Assignment(corev1.ResourceCPU, "tas-default", "1000m").
+					TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+						Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+						Obj()).
+					Obj()).
+				Obj(),
+			now,
+		).
+		AdmittedAt(true, now).
+		Obj()
+
+	for _, useMergePatch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("when the WorkloadRequestUseMergePatch feature is %t", useMergePatch), func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.WorkloadRequestUseMergePatch, useMergePatch)
+			ctx, log := utiltesting.ContextWithLog(t)
+
+			var statusWrites int
+			// Every status write answers NotFound, as if the Workload was deleted while the pass ran.
+			notFound := apierrors.NewNotFound(kueue.Resource("workloads"), wl.Name)
+			clientBuilder := utiltesting.NewClientBuilder().
+				WithObjects(ns.DeepCopy(), topology.DeepCopy(), rf.DeepCopy(), cq.DeepCopy(), lq.DeepCopy(), wl.DeepCopy()).
+				WithStatusSubresource(&kueue.Workload{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+						if _, ok := obj.(*kueue.Workload); ok && subResourceName == "status" {
+							statusWrites++
+							return notFound
+						}
+						return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+					},
+					SubResourceApply: func(ctx context.Context, c client.Client, subResourceName string, applyConf runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+						if subResourceName == "status" {
+							statusWrites++
+							return notFound
+						}
+						return utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration(ctx, c, subResourceName, applyConf, opts...)
+					},
+				})
+			_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
+			cl := clientBuilder.Build()
+			storedWl := &kueue.Workload{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(wl), storedWl); err != nil {
+				t.Fatalf("Getting workload %s: %v", wl.Name, err)
+			}
+			recorder := &utiltesting.EventRecorder{}
+			fakeClock := testingclock.NewFakeClock(now)
+			cqCache := schdcache.New(cl)
+			qManager := qcache.NewManagerForUnitTests(cl, cqCache, qcache.WithClock(fakeClock))
+			for _, node := range nodes {
+				cqCache.TASCache().SyncNode(&node)
+			}
+			cqCache.AddOrUpdateResourceFlavor(log, rf.DeepCopy())
+			cqCache.AddOrUpdateTopology(log, topology.DeepCopy())
+			if err := cqCache.AddClusterQueue(ctx, cq.DeepCopy()); err != nil {
+				t.Fatalf("Inserting clusterQueue %s in cache: %v", cq.Name, err)
+			}
+			if err := qManager.AddClusterQueue(ctx, cq.DeepCopy()); err != nil {
+				t.Fatalf("Inserting clusterQueue %s in manager: %v", cq.Name, err)
+			}
+			if err := qManager.AddLocalQueue(ctx, lq.DeepCopy()); err != nil {
+				t.Fatalf("Inserting queue %s/%s in manager: %v", lq.Namespace, lq.Name, err)
+			}
+			cqCache.AddOrUpdateWorkload(t.Context(), log, storedWl.DeepCopy())
+			if !qManager.QueueSecondPassIfNeeded(ctx, storedWl, 0) {
+				t.Fatal("expected the workload to be queued for a second pass")
+			}
+			fakeClock.Step(time.Second)
+			watcher := &workloadUpdateWatcherRecorder{}
+			qManager.AddWorkloadUpdateWatcher(watcher)
+
+			scheduler := New(qManager, cqCache, cl, recorder, WithClock(t, fakeClock), WithPreemptionExpectations(preemptexpectations.New()))
+			wg := sync.WaitGroup{}
+			scheduler.setAdmissionRoutineWrapper(routine.NewWrapper(
+				func() { wg.Add(1) },
+				func() { wg.Done() },
+			))
+
+			ctx, cancel := context.WithTimeout(ctx, queueingTimeout)
+			defer cancel()
+			go cqCache.CleanUpOnContext(ctx)
+			go qManager.CleanUpOnContext(ctx)
+
+			scheduler.schedule(ctx)
+			wg.Wait()
+
+			if statusWrites != 1 {
+				t.Errorf("got %d workload status writes, want 1: the deleted workload must not be written again", statusWrites)
+			}
+			if !cqCache.ClusterQueueEmpty(kueue.ClusterQueueReference(cq.Name)) {
+				t.Error("the deleted workload is still in the ClusterQueue cache")
+			}
+			if watcher.oldWl == nil || watcher.newWl != nil {
+				t.Errorf("workload update watchers got old=%v, new=%v; want the workload's removal", watcher.oldWl != nil, watcher.newWl != nil)
+			}
+			if diff := cmp.Diff([]utiltesting.EventRecord(nil), recorder.RecordedEvents, cmpopts.IgnoreFields(utiltesting.EventRecord{}, "Message")); diff != "" {
+				t.Errorf("unexpected events (-want,+got):\n%s", diff)
+			}
+
+			// A deleted workload must not be requeued, so no later pass writes it again.
+			fakeClock.Step(time.Minute)
+			scheduler.schedule(ctx)
+			wg.Wait()
+
+			if statusWrites != 1 {
+				t.Errorf("got %d workload status writes, want 1: the deleted workload was requeued", statusWrites)
+			}
+		})
+	}
+}
+
+func TestSecondPassRestoreKeepsNewerCacheState(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+
+	ns := utiltesting.MakeNamespaceWrapper(metav1.NamespaceDefault).Obj()
+	topology := utiltestingapi.MakeDefaultOneLevelTopology("tas-single-level")
+	rf := utiltestingapi.MakeResourceFlavor("tas-default").
+		NodeLabel("tas-node", "true").
+		TopologyName(topology.Name).
+		Obj()
+	cq := utiltestingapi.MakeClusterQueue("tas-main").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").
+			Resource(corev1.ResourceCPU, "50").Obj()).
+		Obj()
+	lq := utiltestingapi.MakeLocalQueue("tas-main", ns.Name).ClusterQueue(cq.Name).Obj()
+	makeNode := func(name string) corev1.Node {
+		return *testingnode.MakeNode(name).
+			Label("tas-node", "true").
+			Label(corev1.LabelHostname, name).
+			StatusAllocatable(corev1.ResourceList{
+				corev1.ResourceCPU:  resource.MustParse("1"),
+				corev1.ResourcePods: resource.MustParse("10"),
+			}).
+			Ready().
+			Obj()
+	}
+	nodes := []corev1.Node{makeNode("x1"), makeNode("x2")}
+	wl := utiltestingapi.MakeWorkload("wl", ns.Name).
+		Queue("tas-main").
+		UnhealthyNodes("x1").
+		PodSets(*utiltestingapi.MakePodSet("one", 1).
+			RequiredTopologyRequest(corev1.LabelHostname).
+			Request(corev1.ResourceCPU, "1").
+			Obj()).
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("tas-main").
+				PodSets(utiltestingapi.MakePodSetAssignment("one").
+					Assignment(corev1.ResourceCPU, "tas-default", "1000m").
+					TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+						Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+						Obj()).
+					Obj()).
+				Obj(),
+			now,
+		).
+		AdmittedAt(true, now).
+		Obj()
+
+	cases := map[string]struct {
+		// duringWrite changes the cache the way a Workload event processed during the status write would.
+		duringWrite func(t *testing.T, ctx context.Context, log logr.Logger, cqCache *schdcache.Cache, stored *kueue.Workload, newerRV string)
+		// verify checks that restoring the version the pass read did not overwrite that change.
+		verify func(t *testing.T, ctx context.Context, cqCache *schdcache.Cache, stored *kueue.Workload, newerRV string)
+	}{
+		"workload removed during the write": {
+			duringWrite: func(t *testing.T, _ context.Context, log logr.Logger, cqCache *schdcache.Cache, stored *kueue.Workload, _ string) {
+				if err := cqCache.DeleteWorkload(log, workload.Key(stored)); err != nil {
+					t.Errorf("Deleting the workload from the cache: %v", err)
+				}
+			},
+			verify: func(t *testing.T, _ context.Context, cqCache *schdcache.Cache, _ *kueue.Workload, _ string) {
+				if !cqCache.ClusterQueueEmpty(kueue.ClusterQueueReference(cq.Name)) {
+					t.Error("the failed second-pass write put a removed workload back in the ClusterQueue cache")
+				}
+			},
+		},
+		"newer version landed during the write": {
+			duringWrite: func(t *testing.T, ctx context.Context, log logr.Logger, cqCache *schdcache.Cache, stored *kueue.Workload, newerRV string) {
+				newer := stored.DeepCopy()
+				newer.ResourceVersion = newerRV
+				newer.Status.UnhealthyNodes = nil
+				if !cqCache.AddOrUpdateWorkload(ctx, log, newer) {
+					t.Error("Failed to update the workload in the cache")
+				}
+			},
+			verify: func(t *testing.T, ctx context.Context, cqCache *schdcache.Cache, stored *kueue.Workload, newerRV string) {
+				snapshot, err := cqCache.Snapshot(ctx)
+				if err != nil {
+					t.Fatalf("Taking a cache snapshot: %v", err)
+				}
+				cached, found := snapshot.ClusterQueue(kueue.ClusterQueueReference(cq.Name)).Workloads[workload.Key(stored)]
+				if !found {
+					t.Fatal("the workload is missing from the ClusterQueue cache")
+				}
+				if cached.Obj.ResourceVersion != newerRV {
+					t.Errorf("the cache holds resourceVersion %q, want the newer %q", cached.Obj.ResourceVersion, newerRV)
+				}
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx, log := utiltesting.ContextWithLog(t)
+
+			var statusWrites int
+			// Set before scheduling; the interceptor runs on the admission goroutine.
+			var cqCache *schdcache.Cache
+			var newerRV string
+			storedWl := &kueue.Workload{}
+			conflict := apierrors.NewConflict(kueue.Resource("workloads"), wl.Name, errors.New("the object has been modified"))
+			clientBuilder := utiltesting.NewClientBuilder().
+				WithObjects(ns.DeepCopy(), topology.DeepCopy(), rf.DeepCopy(), cq.DeepCopy(), lq.DeepCopy(), wl.DeepCopy()).
+				WithStatusSubresource(&kueue.Workload{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					SubResourceApply: func(ctx context.Context, c client.Client, subResourceName string, applyConf runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+						if subResourceName == "status" {
+							statusWrites++
+							tc.duringWrite(t, ctx, log, cqCache, storedWl, newerRV)
+							return conflict
+						}
+						return utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration(ctx, c, subResourceName, applyConf, opts...)
+					},
+				})
+			_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
+			cl := clientBuilder.Build()
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(wl), storedWl); err != nil {
+				t.Fatalf("Getting workload %s: %v", wl.Name, err)
+			}
+			storedRV, err := strconv.ParseInt(storedWl.ResourceVersion, 10, 64)
+			if err != nil {
+				t.Fatalf("Parsing the stored resourceVersion %q: %v", storedWl.ResourceVersion, err)
+			}
+			newerRV = strconv.FormatInt(storedRV+1, 10)
+			recorder := &utiltesting.EventRecorder{}
+			fakeClock := testingclock.NewFakeClock(now)
+			cqCache = schdcache.New(cl)
+			qManager := qcache.NewManagerForUnitTests(cl, cqCache, qcache.WithClock(fakeClock))
+			for _, node := range nodes {
+				cqCache.TASCache().SyncNode(&node)
+			}
+			cqCache.AddOrUpdateResourceFlavor(log, rf.DeepCopy())
+			cqCache.AddOrUpdateTopology(log, topology.DeepCopy())
+			if err := cqCache.AddClusterQueue(ctx, cq.DeepCopy()); err != nil {
+				t.Fatalf("Inserting clusterQueue %s in cache: %v", cq.Name, err)
+			}
+			if err := qManager.AddClusterQueue(ctx, cq.DeepCopy()); err != nil {
+				t.Fatalf("Inserting clusterQueue %s in manager: %v", cq.Name, err)
+			}
+			if err := qManager.AddLocalQueue(ctx, lq.DeepCopy()); err != nil {
+				t.Fatalf("Inserting queue %s/%s in manager: %v", lq.Namespace, lq.Name, err)
+			}
+			cqCache.AddOrUpdateWorkload(t.Context(), log, storedWl.DeepCopy())
+			if !qManager.QueueSecondPassIfNeeded(ctx, storedWl, 0) {
+				t.Fatal("expected the workload to be queued for a second pass")
+			}
+			fakeClock.Step(time.Second)
+
+			scheduler := New(qManager, cqCache, cl, recorder, WithClock(t, fakeClock), WithPreemptionExpectations(preemptexpectations.New()))
+			wg := sync.WaitGroup{}
+			scheduler.setAdmissionRoutineWrapper(routine.NewWrapper(
+				func() { wg.Add(1) },
+				func() { wg.Done() },
+			))
+
+			ctx, cancel := context.WithTimeout(ctx, queueingTimeout)
+			defer cancel()
+			go cqCache.CleanUpOnContext(ctx)
+			go qManager.CleanUpOnContext(ctx)
+
+			scheduler.schedule(ctx)
+			wg.Wait()
+
+			if statusWrites != 1 {
+				t.Errorf("got %d workload status writes, want 1", statusWrites)
+			}
+			tc.verify(t, ctx, cqCache, storedWl, newerRV)
+		})
+	}
+}
+
+func TestSecondPassSkipsAssumeWhenWorkloadChangedInCache(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+
+	ns := utiltesting.MakeNamespaceWrapper(metav1.NamespaceDefault).Obj()
+	topology := utiltestingapi.MakeDefaultOneLevelTopology("tas-single-level")
+	rf := utiltestingapi.MakeResourceFlavor("tas-default").
+		NodeLabel("tas-node", "true").
+		TopologyName(topology.Name).
+		Obj()
+	cq := utiltestingapi.MakeClusterQueue("tas-main").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").
+			Resource(corev1.ResourceCPU, "50").Obj()).
+		Obj()
+	lq := utiltestingapi.MakeLocalQueue("tas-main", ns.Name).ClusterQueue(cq.Name).Obj()
+	makeNode := func(name string) corev1.Node {
+		return *testingnode.MakeNode(name).
+			Label("tas-node", "true").
+			Label(corev1.LabelHostname, name).
+			StatusAllocatable(corev1.ResourceList{
+				corev1.ResourceCPU:  resource.MustParse("1"),
+				corev1.ResourcePods: resource.MustParse("10"),
+			}).
+			Ready().
+			Obj()
+	}
+	nodes := []corev1.Node{makeNode("x1"), makeNode("x2")}
+	wl := utiltestingapi.MakeWorkload("wl", ns.Name).
+		Queue("tas-main").
+		UnhealthyNodes("x1").
+		PodSets(*utiltestingapi.MakePodSet("one", 1).
+			RequiredTopologyRequest(corev1.LabelHostname).
+			Request(corev1.ResourceCPU, "1").
+			Obj()).
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("tas-main").
+				PodSets(utiltestingapi.MakePodSetAssignment("one").
+					Assignment(corev1.ResourceCPU, "tas-default", "1000m").
+					TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+						Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+						Obj()).
+					Obj()).
+				Obj(),
+			now,
+		).
+		AdmittedAt(true, now).
+		Obj()
+
+	type secondPassFixture struct {
+		wl              *kueue.Workload
+		cq              *kueue.ClusterQueue
+		admissionChecks []*kueue.AdmissionCheck
+	}
+	failedNodePass := secondPassFixture{wl: wl, cq: cq}
+	// A delayed topology assignment takes its second pass once its ProvisioningRequest check is Ready.
+	provCheck := utiltestingapi.MakeAdmissionCheck("prov-check").
+		ControllerName(kueue.ProvisioningRequestControllerName).
+		Condition(metav1.Condition{
+			Type:   kueue.AdmissionCheckActive,
+			Status: metav1.ConditionTrue,
+		}).
+		Obj()
+	delayedPass := secondPassFixture{
+		wl: utiltestingapi.MakeWorkload("wl", ns.Name).
+			Queue("tas-main").
+			PodSets(*utiltestingapi.MakePodSet("one", 1).
+				RequiredTopologyRequest(corev1.LabelHostname).
+				Request(corev1.ResourceCPU, "1").
+				Obj()).
+			ReserveQuotaAt(
+				utiltestingapi.MakeAdmission("tas-main").
+					PodSets(utiltestingapi.MakePodSetAssignment("one").
+						Assignment(corev1.ResourceCPU, "tas-default", "1000m").
+						DelayedTopologyRequest(kueue.DelayedTopologyRequestStatePending).
+						Obj()).
+					Obj(),
+				now,
+			).
+			AdmissionCheck(kueue.AdmissionCheckState{
+				Name:  kueue.AdmissionCheckReference(provCheck.Name),
+				State: kueue.CheckStateReady,
+			}).
+			Obj(),
+		cq: utiltestingapi.MakeClusterQueue("tas-main").
+			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").
+				Resource(corev1.ResourceCPU, "50").Obj()).
+			AdmissionChecks(kueue.AdmissionCheckReference(provCheck.Name)).
+			Obj(),
+		admissionChecks: []*kueue.AdmissionCheck{provCheck},
+	}
+
+	releaseReservation := func(t *testing.T, ctx context.Context, log logr.Logger, cl client.Client, cqCache *schdcache.Cache, stored *kueue.Workload) {
+		released := stored.DeepCopy()
+		workload.UnsetQuotaReservationWithCondition(released, "Evicted", "Evicted by test", now)
+		if err := cl.Status().Update(ctx, released); err != nil {
+			t.Fatalf("Unsetting the quota reservation: %v", err)
+		}
+		if err := cqCache.DeleteWorkload(log, workload.Key(released)); err != nil {
+			t.Fatalf("Deleting the workload from the cache: %v", err)
+		}
+	}
+	verifyNoQuotaLeft := func(t *testing.T, _ context.Context, cqCache *schdcache.Cache, _ *kueue.Workload) {
+		if !cqCache.ClusterQueueEmpty(kueue.ClusterQueueReference(cq.Name)) {
+			t.Error("the second pass left quota for a released reservation in the ClusterQueue cache")
+		}
+	}
+
+	cases := map[string]struct {
+		secondPass secondPassFixture
+		// update lands a change in the API after the pass read the workload and feeds it to the cache, as the workload controller does.
+		update func(t *testing.T, ctx context.Context, log logr.Logger, cl client.Client, cqCache *schdcache.Cache, stored *kueue.Workload)
+		// verify checks that the cache still reflects the update rather than this pass's assignment.
+		verify func(t *testing.T, ctx context.Context, cqCache *schdcache.Cache, stored *kueue.Workload)
+	}{
+		"node recovered during the pass": {
+			secondPass: failedNodePass,
+			update: func(t *testing.T, ctx context.Context, log logr.Logger, cl client.Client, cqCache *schdcache.Cache, stored *kueue.Workload) {
+				recovered := stored.DeepCopy()
+				recovered.Status.UnhealthyNodes = nil
+				if err := cl.Status().Update(ctx, recovered); err != nil {
+					t.Fatalf("Clearing the unhealthy nodes: %v", err)
+				}
+				cqCache.AddOrUpdateWorkload(ctx, log, recovered)
+			},
+			verify: func(t *testing.T, ctx context.Context, cqCache *schdcache.Cache, stored *kueue.Workload) {
+				snapshot, err := cqCache.Snapshot(ctx)
+				if err != nil {
+					t.Fatalf("Taking a cache snapshot: %v", err)
+				}
+				cached, found := snapshot.ClusterQueue(kueue.ClusterQueueReference(cq.Name)).Workloads[workload.Key(stored)]
+				if !found {
+					t.Fatal("the workload is missing from the ClusterQueue cache")
+				}
+				if cached.Obj.ResourceVersion == stored.ResourceVersion {
+					t.Errorf("the cache holds resourceVersion %q read by the pass, want the newer one", cached.Obj.ResourceVersion)
+				}
+				gotNodes := sets.New[string]()
+				for value := range utiltas.LowestLevelValues(cached.Obj.Status.Admission.PodSetAssignments[0].TopologyAssignment) {
+					gotNodes.Insert(value)
+				}
+				if diff := cmp.Diff(sets.New("x1"), gotNodes); diff != "" {
+					t.Errorf("the cache holds this pass's assignment instead of the recovered one (-want,+got):\n%s", diff)
+				}
+			},
+		},
+		"reservation released during the pass": {
+			secondPass: failedNodePass,
+			update:     releaseReservation,
+			verify:     verifyNoQuotaLeft,
+		},
+		"delayed topology assignment updated during the pass": {
+			secondPass: delayedPass,
+			update: func(t *testing.T, ctx context.Context, log logr.Logger, cl client.Client, cqCache *schdcache.Cache, stored *kueue.Workload) {
+				// An unrelated status change that leaves the workload waiting for its delayed topology assignment.
+				updated := stored.DeepCopy()
+				updated.Status.AdmissionChecks[0].Message = "provisioned"
+				if err := cl.Status().Update(ctx, updated); err != nil {
+					t.Fatalf("Updating the admission check message: %v", err)
+				}
+				if !workload.NeedsSecondPass(updated) {
+					t.Fatal("expected the updated workload to still need its delayed second pass")
+				}
+				cqCache.AddOrUpdateWorkload(ctx, log, updated)
+			},
+			verify: func(t *testing.T, ctx context.Context, cqCache *schdcache.Cache, stored *kueue.Workload) {
+				snapshot, err := cqCache.Snapshot(ctx)
+				if err != nil {
+					t.Fatalf("Taking a cache snapshot: %v", err)
+				}
+				cached, found := snapshot.ClusterQueue(kueue.ClusterQueueReference(cq.Name)).Workloads[workload.Key(stored)]
+				if !found {
+					t.Fatal("the workload is missing from the ClusterQueue cache")
+				}
+				if cached.Obj.ResourceVersion == stored.ResourceVersion {
+					t.Errorf("the cache holds resourceVersion %q read by the pass, want the newer one", cached.Obj.ResourceVersion)
+				}
+				if !workload.HasTopologyAssignmentsPending(cached.Obj) {
+					t.Errorf("the cache holds this pass's topology assignment instead of the pending one, got %v", cached.Obj.Status.Admission.PodSetAssignments[0])
+				}
+			},
+		},
+		"delayed topology assignment released during the pass": {
+			secondPass: delayedPass,
+			update:     releaseReservation,
+			verify:     verifyNoQuotaLeft,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx, log := utiltesting.ContextWithLog(t)
+			wl, cq := tc.secondPass.wl, tc.secondPass.cq
+
+			var statusWrites int
+			conflict := apierrors.NewConflict(kueue.Resource("workloads"), wl.Name, errors.New("the object has been modified"))
+			clientBuilder := utiltesting.NewClientBuilder().
+				WithObjects(ns.DeepCopy(), topology.DeepCopy(), rf.DeepCopy(), cq.DeepCopy(), lq.DeepCopy(), wl.DeepCopy()).
+				WithStatusSubresource(&kueue.Workload{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+						if _, ok := obj.(*kueue.Workload); ok && subResourceName == "status" {
+							statusWrites++
+							return conflict
+						}
+						return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+					},
+					SubResourceApply: func(ctx context.Context, c client.Client, subResourceName string, applyConf runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+						if subResourceName == "status" {
+							statusWrites++
+							return conflict
+						}
+						return utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration(ctx, c, subResourceName, applyConf, opts...)
+					},
+				})
+			_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
+			cl := clientBuilder.Build()
+			storedWl := &kueue.Workload{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(wl), storedWl); err != nil {
+				t.Fatalf("Getting workload %s: %v", wl.Name, err)
+			}
+			recorder := &utiltesting.EventRecorder{}
+			fakeClock := testingclock.NewFakeClock(now)
+			cqCache := schdcache.New(cl)
+			qManager := qcache.NewManagerForUnitTests(cl, cqCache, qcache.WithClock(fakeClock))
+			for _, node := range nodes {
+				cqCache.TASCache().SyncNode(&node)
+			}
+			for _, ac := range tc.secondPass.admissionChecks {
+				cqCache.AddOrUpdateAdmissionCheck(log, ac.DeepCopy())
+			}
+			cqCache.AddOrUpdateResourceFlavor(log, rf.DeepCopy())
+			cqCache.AddOrUpdateTopology(log, topology.DeepCopy())
+			if err := cqCache.AddClusterQueue(ctx, cq.DeepCopy()); err != nil {
+				t.Fatalf("Inserting clusterQueue %s in cache: %v", cq.Name, err)
+			}
+			if err := qManager.AddClusterQueue(ctx, cq.DeepCopy()); err != nil {
+				t.Fatalf("Inserting clusterQueue %s in manager: %v", cq.Name, err)
+			}
+			if err := qManager.AddLocalQueue(ctx, lq.DeepCopy()); err != nil {
+				t.Fatalf("Inserting queue %s/%s in manager: %v", lq.Namespace, lq.Name, err)
+			}
+			cqCache.AddOrUpdateWorkload(t.Context(), log, storedWl.DeepCopy())
+			if !qManager.QueueSecondPassIfNeeded(ctx, storedWl, 0) {
+				t.Fatal("expected the workload to be queued for a second pass")
+			}
+			// The pass reads the workload when it becomes ready, before the competing update lands.
+			fakeClock.Step(time.Second)
+			tc.update(t, ctx, log, cl, cqCache, storedWl)
+
+			scheduler := New(qManager, cqCache, cl, recorder, WithClock(t, fakeClock), WithPreemptionExpectations(preemptexpectations.New()))
+			wg := sync.WaitGroup{}
+			scheduler.setAdmissionRoutineWrapper(routine.NewWrapper(
+				func() { wg.Add(1) },
+				func() { wg.Done() },
+			))
+
+			ctx, cancel := context.WithTimeout(ctx, queueingTimeout)
+			defer cancel()
+			go cqCache.CleanUpOnContext(ctx)
+			go qManager.CleanUpOnContext(ctx)
+
+			scheduler.schedule(ctx)
+			wg.Wait()
+
+			if statusWrites != 0 {
+				t.Errorf("got %d workload status writes, want 0: a pass computed from an outdated workload must not write", statusWrites)
+			}
+			tc.verify(t, ctx, cqCache, storedWl)
+			wantEvents := []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord(ns.Name, wl.Name, "SecondPassFailed", corev1.EventTypeWarning).Obj(),
+			}
+			if diff := cmp.Diff(wantEvents, recorder.RecordedEvents, cmpopts.IgnoreFields(utiltesting.EventRecord{}, "Message")); diff != "" {
+				t.Errorf("unexpected events (-want,+got):\n%s", diff)
 			}
 		})
 	}

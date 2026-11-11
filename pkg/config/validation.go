@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"net/netip"
 	"regexp"
 	"slices"
 	"strings"
@@ -63,7 +64,6 @@ var (
 	integrationsFrameworksPath            = integrationsPath.Child("frameworks")
 	integrationsExternalFrameworkPath     = integrationsPath.Child("externalFrameworks")
 	managedJobsNamespaceSelectorPath      = field.NewPath("managedJobsNamespaceSelector")
-	quotaReleaseStrategyPath              = field.NewPath("quotaReleaseStrategy")
 	waitForPodsReadyPath                  = field.NewPath("waitForPodsReady")
 	requeuingStrategyPath                 = waitForPodsReadyPath.Child("requeuingStrategy")
 	multiKueuePath                        = field.NewPath("multiKueue")
@@ -108,8 +108,8 @@ func Validate(c *configapi.Configuration, scheme *runtime.Scheme, integrationMan
 	allErrs = append(allErrs, validateTLS(c)...)
 	allErrs = append(allErrs, validateVisibilityServer(c)...)
 	allErrs = append(allErrs, validateCustomLabels(c)...)
+	allErrs = append(allErrs, validateMetrics(c.Metrics)...)
 	allErrs = append(allErrs, validateQuotaCheckStrategy(c)...)
-	allErrs = append(allErrs, validateQuotaReleaseStrategy(c)...)
 	return allErrs
 }
 
@@ -134,24 +134,6 @@ func validateQuotaCheckStrategy(c *configapi.Configuration) field.ErrorList {
 				[]configapi.QuotaCheckStrategy{
 					configapi.QuotaCheckIgnoreUndeclared,
 					configapi.QuotaCheckBlockUndeclared,
-				},
-			))
-		}
-	}
-	return allErrs
-}
-
-func validateQuotaReleaseStrategy(c *configapi.Configuration) field.ErrorList {
-	var allErrs field.ErrorList
-	if c.QuotaReleaseStrategy != nil {
-		strategy := *c.QuotaReleaseStrategy
-		if strategy != configapi.QuotaReleaseOnTerminating && strategy != configapi.QuotaReleaseOnTerminal {
-			allErrs = append(allErrs, field.NotSupported(
-				quotaReleaseStrategyPath,
-				strategy,
-				[]configapi.QuotaReleaseStrategy{
-					configapi.QuotaReleaseOnTerminating,
-					configapi.QuotaReleaseOnTerminal,
 				},
 			))
 		}
@@ -296,6 +278,18 @@ func validateClusterProfileAccessProviders(providers []configapi.ClusterProfileA
 
 func validateWaitForPodsReady(c *configapi.Configuration) field.ErrorList {
 	var allErrs field.ErrorList
+	if features.Enabled(features.WaitForPodsReadyUnscheduledTimeout) && features.Enabled(features.DisableWaitForPodsReady) {
+		allErrs = append(allErrs, field.Forbidden(featureGatesPath.Key(string(features.WaitForPodsReadyUnscheduledTimeout)),
+			"cannot be enabled together with DisableWaitForPodsReady"))
+	}
+	if features.Enabled(features.WorkloadLevelWaitForPodsReady) && features.Enabled(features.DisableWaitForPodsReady) {
+		allErrs = append(allErrs, field.Forbidden(featureGatesPath.Key(string(features.WorkloadLevelWaitForPodsReady)),
+			"cannot be enabled together with DisableWaitForPodsReady"))
+	}
+	if c.WaitForPodsReady != nil && c.WaitForPodsReady.UnscheduledTimeout != nil && !features.Enabled(features.WaitForPodsReadyUnscheduledTimeout) {
+		allErrs = append(allErrs, field.Forbidden(waitForPodsReadyPath.Child("unscheduledTimeout"),
+			"requires the WaitForPodsReadyUnscheduledTimeout feature gate"))
+	}
 	if !waitforpodsready.Enabled(c.WaitForPodsReady) {
 		return allErrs
 	}
@@ -309,6 +303,20 @@ func validateWaitForPodsReady(c *configapi.Configuration) field.ErrorList {
 	if c.WaitForPodsReady.RecoveryTimeout != nil && c.WaitForPodsReady.RecoveryTimeout.Duration < 0 {
 		allErrs = append(allErrs, field.Invalid(waitForPodsReadyPath.Child("recoveryTimeout"),
 			c.WaitForPodsReady.RecoveryTimeout, apimachineryvalidation.IsNegativeErrorMsg))
+	}
+	if ut := c.WaitForPodsReady.UnscheduledTimeout; ut != nil {
+		switch {
+		case ut.Duration < 0:
+			allErrs = append(allErrs, field.Invalid(waitForPodsReadyPath.Child("unscheduledTimeout"),
+				ut, apimachineryvalidation.IsNegativeErrorMsg))
+		case ut.Duration > c.WaitForPodsReady.Timeout.Duration:
+			allErrs = append(allErrs, field.Invalid(waitForPodsReadyPath.Child("unscheduledTimeout"),
+				ut, "must not exceed waitForPodsReady.timeout"))
+		}
+	}
+	if c.WaitForPodsReady.MaxTimeoutOnWorkload != nil && c.WaitForPodsReady.MaxTimeoutOnWorkload.Duration <= 0 {
+		allErrs = append(allErrs, field.Invalid(waitForPodsReadyPath.Child("maxTimeoutOnWorkload"),
+			c.WaitForPodsReady.MaxTimeoutOnWorkload, "must be greater than 0"))
 	}
 	if strategy := c.WaitForPodsReady.RequeuingStrategy; strategy != nil {
 		if strategy.Timestamp != nil &&
@@ -464,19 +472,21 @@ func validateAdmissionFairSharing(c *configapi.Configuration) field.ErrorList {
 	}
 	if afs.UsageSamplingInterval.Duration <= 0 {
 		allErrs = append(allErrs, field.Invalid(afsPath.Child("usageSamplingInterval"),
-			afs.UsageHalfLifeTime, "must be greater than 0"))
+			afs.UsageSamplingInterval, "must be greater than 0"))
 	}
 	for resName, weight := range afs.ResourceWeights {
 		if weight < 0 {
 			allErrs = append(allErrs, field.Invalid(afsResourceWeightsPath.Key(string(resName)),
-				afs.ResourceWeights, apimachineryvalidation.IsNegativeErrorMsg))
+				weight, apimachineryvalidation.IsNegativeErrorMsg))
 		}
 	}
 	return allErrs
 }
 
-// reservedResourceNameMsg repeats the Workload webhook's wording for the same refusal; the two are not linked.
-const reservedResourceNameMsg = "the key is reserved for internal kueue use"
+// reservedResourceNameError mirrors the Workload webhook's error for a pods key.
+func reservedResourceNameError(path *field.Path) *field.Error {
+	return field.Invalid(path, corev1.ResourcePods, "the key is reserved for internal kueue use")
+}
 
 func validateResourceTransformations(c *configapi.Configuration) field.ErrorList {
 	res := c.Resources
@@ -502,19 +512,13 @@ func validateResourceTransformations(c *configapi.Configuration) field.ErrorList
 		// because the refusal exits the manager on a file that used to load.
 		if refuseReserved {
 			if transform.Input == corev1.ResourcePods {
-				allErrs = append(allErrs, field.Invalid(
-					resourceTransformationPath.Index(idx).Child("input"),
-					transform.Input, reservedResourceNameMsg))
+				allErrs = append(allErrs, reservedResourceNameError(resourceTransformationPath.Index(idx).Child("input")))
 			}
 			if _, ok := transform.Outputs[corev1.ResourcePods]; ok {
-				allErrs = append(allErrs, field.Invalid(
-					resourceTransformationPath.Index(idx).Child("outputs").Key(string(corev1.ResourcePods)),
-					corev1.ResourcePods, reservedResourceNameMsg))
+				allErrs = append(allErrs, reservedResourceNameError(resourceTransformationPath.Index(idx).Child("outputs").Key(string(corev1.ResourcePods))))
 			}
 			if transform.MultiplyBy == corev1.ResourcePods {
-				allErrs = append(allErrs, field.Invalid(
-					resourceTransformationPath.Index(idx).Child("multiplyBy"),
-					transform.MultiplyBy, reservedResourceNameMsg))
+				allErrs = append(allErrs, reservedResourceNameError(resourceTransformationPath.Index(idx).Child("multiplyBy")))
 			}
 		}
 	}
@@ -553,7 +557,7 @@ func validateDeviceClassMappings(c *configapi.Configuration) field.ErrorList {
 		// The mapper is only built with DRA on, so until then the name is dormant
 		// and refusing it would fail an upgrade over an entry that does nothing.
 		if refuseReserved && features.Enabled(features.KueueDRAIntegration) && mapping.Name == corev1.ResourcePods {
-			allErrs = append(allErrs, field.Invalid(mappingPath.Child("name"), mapping.Name, reservedResourceNameMsg))
+			allErrs = append(allErrs, reservedResourceNameError(mappingPath.Child("name")))
 		}
 
 		if seenResourceNames.Has(mapping.Name) {
@@ -709,21 +713,6 @@ func LoadAndValidateFeatureGates(featureGateCLI string, featureGateMap map[strin
 		if err := utilfeature.DefaultMutableFeatureGate.SetFromMap(featureGateMap); err != nil {
 			return field.ErrorList{field.Invalid(featureGatesPath, featureGateMap, err.Error())}
 		}
-	}
-
-	TASProfilesEnabled := []bool{features.Enabled(features.TASProfileMixed)}
-	enabledProfilesCount := 0
-	for _, enabled := range TASProfilesEnabled {
-		if enabled {
-			enabledProfilesCount++
-		}
-	}
-	// Currently dead code but leaving in if more TASProfiles are added
-	if enabledProfilesCount > 1 {
-		allErrs = append(allErrs, field.Invalid(featureGatesPath, TASProfilesEnabled, "cannot use more than one TAS profiles"))
-	}
-	if !features.Enabled(features.TopologyAwareScheduling) && enabledProfilesCount > 0 {
-		allErrs = append(allErrs, field.Invalid(featureGatesPath, enabledProfilesCount, "cannot use a TAS profile with TAS disabled"))
 	}
 
 	return allErrs
@@ -954,6 +943,32 @@ func validateCIdentifier(id string, fldPath *field.Path) field.ErrorList {
 	}
 	for _, msg := range content.IsCIdentifier(id) {
 		allErrs = append(allErrs, field.Invalid(fldPath, id, msg))
+	}
+	return allErrs
+}
+
+func validateMetrics(metrics configapi.ControllerMetrics) field.ErrorList {
+	modePath := field.NewPath("metrics", "accessControlMode")
+	if !features.Enabled(features.MetricsAccessControl) {
+		if metrics.AccessControlMode != nil {
+			return field.ErrorList{field.Forbidden(modePath, "requires the MetricsAccessControl feature gate")}
+		}
+		return nil
+	}
+	mode := ptr.Deref(metrics.AccessControlMode, configapi.MetricsAccessControlModeDelegated)
+	if mode != configapi.MetricsAccessControlModeDelegated && mode != configapi.MetricsAccessControlModeNone {
+		return field.ErrorList{field.NotSupported(modePath, mode, []configapi.MetricsAccessControlMode{
+			configapi.MetricsAccessControlModeDelegated, configapi.MetricsAccessControlModeNone,
+		})}
+	}
+	if mode != configapi.MetricsAccessControlModeNone || metrics.BindAddress == "0" {
+		return nil
+	}
+	var allErrs field.ErrorList
+	address, err := netip.ParseAddrPort(metrics.BindAddress)
+	if err != nil || !address.Addr().Unmap().IsLoopback() || address.Port() == 0 {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("metrics", "bindAddress"), metrics.BindAddress,
+			"accessControlMode None requires a literal loopback IP and numeric port in the range 1–65535 (for example 127.0.0.1:8443 or [::1]:8443); use Delegated for other addresses"))
 	}
 	return allErrs
 }

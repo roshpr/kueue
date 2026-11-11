@@ -1,1 +1,1 @@
-FROM public.ecr.aws/docker/library/golang:1.27@sha256:512690a5660563b57d37ecc31129e7f136e831db2aed24a1dbeb8ad7380dc0fa
+FROM public.ecr.aws/docker/library/golang:1.27@sha256:9048d5e7751706200eb1719c7dae0436950d362f29a1da91fa05e5c63867c60f

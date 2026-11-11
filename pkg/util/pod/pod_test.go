@@ -30,11 +30,13 @@ import (
 	testingclock "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/metrics"
 	"sigs.k8s.io/kueue/pkg/util/roletracker"
+	testingmetrics "sigs.k8s.io/kueue/pkg/util/testing/metrics"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
 )
@@ -164,7 +166,84 @@ func TestGate(t *testing.T) {
 	}
 }
 
+func TestGateFromTemplate(t *testing.T) {
+	basePod := testingpod.MakePod("", "")
+
+	testCases := map[string]struct {
+		pod      *corev1.Pod
+		template *corev1.PodTemplateSpec
+		wantPod  *corev1.Pod
+	}{
+		"nil template": {
+			pod:     basePod.Clone().Gate("example.com/gate").Obj(),
+			wantPod: basePod.Clone().Gate("example.com/gate").Obj(),
+		},
+		"adds the template gates and keeps the pod gates": {
+			pod: basePod.Clone().Gate("example.com/gate").Obj(),
+			template: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{SchedulingGates: []corev1.PodSchedulingGate{
+				{Name: "example.com/gate"},
+				{Name: "example.com/gate2"},
+			}}},
+			wantPod: basePod.Clone().Gate("example.com/gate", "example.com/gate2").Obj(),
+		},
+	}
+
+	for desc, tc := range testCases {
+		t.Run(desc, func(t *testing.T) {
+			GateFromTemplate(tc.pod, tc.template)
+			if diff := cmp.Diff(tc.wantPod.Spec.SchedulingGates, tc.pod.Spec.SchedulingGates); diff != "" {
+				t.Errorf("Unexpected scheduling gates\ndiff=%s", diff)
+			}
+		})
+	}
+}
+
 func TestReadUIntFromLabel(t *testing.T) {
+	basePod := testingpod.MakePod("pod", "ns")
+
+	testCases := map[string]struct {
+		obj     client.Object
+		label   string
+		wantVal *int
+		wantErr error
+	}{
+		"label not found": {
+			obj:     basePod.DeepCopy(),
+			label:   "label",
+			wantErr: ErrLabelNotFound,
+		},
+		"invalid label value": {
+			obj: basePod.Clone().
+				Label("label", "value").
+				Obj(),
+			label:   "label",
+			wantErr: ErrInvalidUInt,
+		},
+		"no upper bound on the value": {
+			obj: basePod.Clone().
+				Label("label", "1000000").
+				Obj(),
+			label:   "label",
+			wantVal: new(1000000),
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			gotValue, gotErr := ReadUIntFromLabel(tc.obj, tc.label)
+
+			if diff := cmp.Diff(tc.wantVal, gotValue); diff != "" {
+				t.Errorf("Unexpected value (-want,+got):\n%s", diff)
+			}
+
+			if diff := cmp.Diff(tc.wantErr, gotErr, cmpopts.EquateErrors()); diff != "" {
+				t.Errorf("ReadUIntFromLabel returned error (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestReadUIntFromLabelBelowBound(t *testing.T) {
 	basePod := testingpod.MakePod("pod", "ns")
 
 	testCases := map[string]struct {
@@ -221,7 +300,7 @@ func TestReadUIntFromLabel(t *testing.T) {
 			}
 
 			if diff := cmp.Diff(tc.wantErr, gotErr, cmpopts.EquateErrors()); diff != "" {
-				t.Errorf("Reconcile returned error (-want,+got):\n%s", diff)
+				t.Errorf("ReadUIntFromLabelBelowBound returned error (-want,+got):\n%s", diff)
 			}
 		})
 	}
@@ -258,6 +337,69 @@ func TestIsTerminated(t *testing.T) {
 			got := IsTerminated(tc.pod)
 			if tc.wantTerminated != got {
 				t.Errorf("Unexpected Pod terminal\nwant: %v\ngot: %v\n", tc.wantTerminated, got)
+			}
+		})
+	}
+}
+
+func TestIsScheduled(t *testing.T) {
+	cases := map[string]struct {
+		pod           *corev1.Pod
+		wantScheduled bool
+	}{
+		"node name without PodScheduled condition": {
+			pod: testingpod.MakePod("", "").
+				NodeName("node-1").
+				Obj(),
+		},
+		"PodScheduled=True without node name": {
+			pod: testingpod.MakePod("", "").
+				StatusConditions(corev1.PodCondition{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}).
+				Obj(),
+		},
+		"PodScheduled=False": {
+			pod: testingpod.MakePod("", "").
+				StatusConditions(corev1.PodCondition{Type: corev1.PodScheduled, Status: corev1.ConditionFalse}).
+				Obj(),
+		},
+		"node name and PodScheduled=False": {
+			pod: testingpod.MakePod("", "").
+				NodeName("node-1").
+				StatusConditions(corev1.PodCondition{Type: corev1.PodScheduled, Status: corev1.ConditionFalse}).
+				Obj(),
+		},
+		"node name and PodScheduled=Unknown": {
+			pod: testingpod.MakePod("", "").
+				NodeName("node-1").
+				StatusConditions(corev1.PodCondition{Type: corev1.PodScheduled, Status: corev1.ConditionUnknown}).
+				Obj(),
+		},
+		"node name and PodScheduled=True": {
+			pod: testingpod.MakePod("", "").
+				NodeName("node-1").
+				StatusConditions(corev1.PodCondition{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}).
+				Obj(),
+			wantScheduled: true,
+		},
+		"gated pod without the condition": {
+			pod: testingpod.MakePod("", "").
+				KueueSchedulingGate().
+				Obj(),
+		},
+		"failed pod with node name and PodScheduled=True": {
+			pod: testingpod.MakePod("", "").
+				NodeName("node-1").
+				StatusConditions(corev1.PodCondition{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}).
+				StatusPhase(corev1.PodFailed).
+				Obj(),
+			wantScheduled: true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := IsScheduled(tc.pod)
+			if diff := cmp.Diff(tc.wantScheduled, got); diff != "" {
+				t.Errorf("Unexpected Pod scheduled (-want,+got):\n%s", diff)
 			}
 		})
 	}
@@ -385,7 +527,7 @@ func TestRecordPodSchedulingGateRemovalSecondsReplicaRole(t *testing.T) {
 				AdmittedAt(tc.admitted, now.Add(-2*time.Second)).
 				Obj()
 
-			RecordPodSchedulingGateRemovalSeconds(testingclock.NewFakeClock(now), gateName, wl, false, tc.tracker)
+			RecordPodSchedulingGateRemovalSeconds(testingclock.NewFakeClock(now), gateName, wl, false, nil, tc.tracker)
 
 			count, err := testutil.GetHistogramMetricCount(
 				metrics.PodSchedulingGateRemovalSeconds.WithLabelValues(gateName, string(cqName), "false", tc.wantRole),
@@ -509,7 +651,7 @@ func TestRecordPodSchedulingGateRemovalSeconds(t *testing.T) {
 				AdmittedAt(true, tc.admittedAt).
 				Obj()
 
-			RecordPodSchedulingGateRemovalSeconds(testingclock.NewFakeClock(now), gateName, wl, false, nil)
+			RecordPodSchedulingGateRemovalSeconds(testingclock.NewFakeClock(now), gateName, wl, false, nil, nil)
 
 			seconds, err := testutil.GetHistogramMetricValue(
 				metrics.PodSchedulingGateRemovalSeconds.WithLabelValues(gateName, string(cqName), "false", roletracker.RoleStandalone),
@@ -519,6 +661,49 @@ func TestRecordPodSchedulingGateRemovalSeconds(t *testing.T) {
 			}
 			if seconds != tc.wantSeconds {
 				t.Errorf("Unexpected metric value: want %v, got %v", tc.wantSeconds, seconds)
+			}
+		})
+	}
+}
+
+func TestRecordPodSchedulingGateRemovalSecondsCustomLabels(t *testing.T) {
+	admittedAt := time.Now().Truncate(time.Second)
+	wl := utiltestingapi.MakeWorkload("wl", "default").
+		SimpleReserveQuota("cq", "rf", admittedAt).
+		AdmittedAt(true, admittedAt).
+		Obj()
+
+	cases := map[string]struct {
+		entries    []configapi.ControllerMetricsCustomLabel
+		stored     map[string]string
+		wantLabels map[string]string
+	}{
+		"none configured": {
+			wantLabels: map[string]string{"name": "gate", "cluster_queue": "cq", "is_group": "false"},
+		},
+		"the admitting cluster queue's value is resolved": {
+			entries: []configapi.ControllerMetricsCustomLabel{{Name: "team"}},
+			stored:  map[string]string{"team": "red"},
+			wantLabels: map[string]string{
+				"name": "gate", "cluster_queue": "cq", "is_group": "false", "custom_team": "red",
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.CustomMetricLabels, true)
+			cl := metrics.NewCustomLabels(tc.entries)
+			t.Cleanup(func() { metrics.InitMetricVectors(nil) })
+			if tc.stored != nil {
+				cl.CQStore("cq", tc.stored, nil)
+			}
+
+			clock := testingclock.NewFakeClock(admittedAt.Add(time.Second))
+			RecordPodSchedulingGateRemovalSeconds(clock, "gate", wl, false, cl, nil)
+
+			got := testingmetrics.CollectFilteredGaugeVec(metrics.PodSchedulingGateRemovalSeconds, tc.wantLabels)
+			if len(got) != 1 {
+				t.Errorf("recorded %d series matching %v, want 1", len(got), tc.wantLabels)
 			}
 		})
 	}

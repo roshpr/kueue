@@ -1,5 +1,5 @@
 # defaulted ARGs need to be declared first
-ARG BUILDER_IMAGE=public.ecr.aws/docker/library/golang:1.26
+ARG BUILDER_IMAGE=public.ecr.aws/docker/library/golang:1.27
 ARG BASE_IMAGE=gcr.io/distroless/static:nonroot
 # compilation stage for the manager binary
 FROM --platform=${BUILDPLATFORM} ${BUILDER_IMAGE} AS builder
@@ -7,7 +7,7 @@ WORKDIR /workspace
 # fetch dependencies first, for iterative development
 COPY go.mod go.sum ./
 COPY hack/testing/retry.sh /usr/local/bin/retry.sh
-RUN retry.sh --attempts 7 --delay 2 --exponential --stream -- go mod download
+RUN retry.sh --stream -- go mod download
 # copy the rest of the sources and build
 COPY . .
 ARG GIT_TAG GIT_COMMIT TARGETARCH CGO_ENABLED=0
